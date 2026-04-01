@@ -1,4 +1,3 @@
-// Safe execFile wrapper — uses execFile (array args, no shell injection)
 import { execFile as nodeExecFile } from 'node:child_process'
 
 export interface ExecResult {

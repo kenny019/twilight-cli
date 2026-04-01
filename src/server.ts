@@ -47,16 +47,13 @@ export function createApp(deps: AppDeps) {
 
   // ── GET /pnl ────────────────────────────────────────────────────
   app.get('/pnl', (c) => {
-    const trades = deps.db.listTrades()
-    const total = trades.reduce((sum, t) => sum + t.pnl, 0)
+    const allTrades = deps.db.listTrades()
+    const total = allTrades.reduce((sum, t) => sum + t.pnl, 0)
 
-    // Group pnl by strategyId via a second listTrades call per strategy is impractical
-    // with the mock — instead derive strategies from the scheduler statuses and sum per strategy
     const strategyIds = deps.scheduler.getStatuses().map((s) => s.id)
     const strategies: Record<string, number> = {}
     for (const id of strategyIds) {
-      const stratTrades = deps.db.listTrades({ strategyId: id })
-      strategies[id] = stratTrades.reduce((sum, t) => sum + t.pnl, 0)
+      strategies[id] = deps.db.listTrades({ strategyId: id }).reduce((sum, t) => sum + t.pnl, 0)
     }
 
     return c.json({ total, strategies })

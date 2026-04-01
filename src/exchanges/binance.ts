@@ -114,28 +114,21 @@ export class BinanceClientImpl implements BinanceClient {
   // ─── WebSocket with REST fallback ────────────────────────────────
 
   async watchPrice(callback: (price: number) => void): Promise<() => void> {
-    const id = setInterval(async () => {
-      try {
-        const price = await this.getPrice()
-        callback(price)
-      } catch {
-        // swallow transient errors in polling loop
-      }
-    }, WATCH_INTERVAL_MS)
-
-    return () => clearInterval(id)
+    return this.poll(() => this.getPrice(), callback)
   }
 
   async watchFundingRate(callback: (rate: number) => void): Promise<() => void> {
+    return this.poll(() => this.getFundingRate(), callback)
+  }
+
+  private poll<T>(fetcher: () => Promise<T>, callback: (value: T) => void): () => void {
     const id = setInterval(async () => {
       try {
-        const rate = await this.getFundingRate()
-        callback(rate)
+        callback(await fetcher())
       } catch {
-        // swallow transient errors in polling loop
+        // Transient errors (rate limits, network) — retry on next interval
       }
     }, WATCH_INTERVAL_MS)
-
     return () => clearInterval(id)
   }
 

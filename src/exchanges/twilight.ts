@@ -37,7 +37,7 @@ export class TwilightClientImpl implements TwilightClient {
       const { stdout } = await execFileAsync(this.bin, args, {})
       return JSON.parse(stdout)
     } catch (err) {
-      throw new Error(`relayer-cli failed: ${(err as Error).message}`)
+      throw new Error(`relayer-cli failed: ${(err as Error).message}`, { cause: err })
     }
   }
 

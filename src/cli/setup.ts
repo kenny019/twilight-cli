@@ -33,7 +33,7 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
       type: 'checkbox',
       name: 'strategies',
       message: 'Select strategies to enable:',
-      choices: ['funding-arb', 'lending-yield', 'basis-trade'],
+      choices: ['funding-arb', 'lending-yield'],
     },
   ])
 

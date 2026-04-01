@@ -39,9 +39,10 @@ export class FundingArbStrategy implements Strategy {
     const { ctx, config } = this
 
     try {
-      const [twilightRate, binanceRate] = await Promise.all([
+      const [twilightRate, binanceRate, price] = await Promise.all([
         ctx.twilight.fundingRate(),
         ctx.binance.getFundingRate(),
+        ctx.twilight.marketPrice(),
       ])
 
       const differential = Math.abs(binanceRate - twilightRate)
@@ -54,8 +55,6 @@ export class FundingArbStrategy implements Strategy {
           ctx.log.warn('Risk check blocked entry', { reason: riskCheck.reason })
           return
         }
-
-        const price = await ctx.twilight.marketPrice()
 
         // Determine position size in BTC for Binance (positionSizeSats / 1e8 * price, simplified to 1 unit)
         const btcSize = config.positionSizeSats / 1e8

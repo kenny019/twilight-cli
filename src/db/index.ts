@@ -1,6 +1,6 @@
 import BetterSqlite3 from 'better-sqlite3'
 import { drizzle } from 'drizzle-orm/better-sqlite3'
-import { eq, and } from 'drizzle-orm'
+import { eq, and, type SQL } from 'drizzle-orm'
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3'
 import type {
   Database,
@@ -78,6 +78,12 @@ function uuid(): string {
   return crypto.randomUUID()
 }
 
+function whereAll(conditions: SQL[]): SQL | undefined {
+  if (conditions.length === 0) return undefined
+  if (conditions.length === 1) return conditions[0]
+  return and(...conditions)
+}
+
 export function createDatabase(path: string): Database {
   const sqlite = new BetterSqlite3(path)
   // Apply schema — idempotent via IF NOT EXISTS
@@ -115,13 +121,11 @@ export function createDatabase(path: string): Database {
     },
 
     listStrategies(filter?) {
-      let query = db.select().from(strategies).$dynamic()
-      const conditions = []
+      const conditions: SQL[] = []
       if (filter?.status) conditions.push(eq(strategies.status, filter.status))
       if (filter?.type) conditions.push(eq(strategies.type, filter.type))
-      if (conditions.length === 1) query = query.where(conditions[0])
-      if (conditions.length > 1) query = query.where(and(...conditions))
-      return query.all() as StrategyRecord[]
+      const w = whereAll(conditions)
+      return (w ? db.select().from(strategies).where(w) : db.select().from(strategies)).all() as StrategyRecord[]
     },
 
     // ── Positions ───────────────────────────────────────────────────
@@ -155,14 +159,12 @@ export function createDatabase(path: string): Database {
     },
 
     listPositions(filter?) {
-      let query = db.select().from(positions).$dynamic()
-      const conditions = []
+      const conditions: SQL[] = []
       if (filter?.strategyId) conditions.push(eq(positions.strategyId, filter.strategyId))
       if (filter?.status) conditions.push(eq(positions.status, filter.status))
       if (filter?.exchange) conditions.push(eq(positions.exchange, filter.exchange))
-      if (conditions.length === 1) query = query.where(conditions[0])
-      if (conditions.length > 1) query = query.where(and(...conditions))
-      return query.all() as PositionRecord[]
+      const w = whereAll(conditions)
+      return (w ? db.select().from(positions).where(w) : db.select().from(positions)).all() as PositionRecord[]
     },
 
     // ── Trades ──────────────────────────────────────────────────────
@@ -229,13 +231,11 @@ export function createDatabase(path: string): Database {
     },
 
     listAccounts(filter?) {
-      let query = db.select().from(accounts).$dynamic()
-      const conditions = []
+      const conditions: SQL[] = []
       if (filter?.exchange) conditions.push(eq(accounts.exchange, filter.exchange))
       if (filter?.status) conditions.push(eq(accounts.status, filter.status))
-      if (conditions.length === 1) query = query.where(conditions[0])
-      if (conditions.length > 1) query = query.where(and(...conditions))
-      return query.all() as AccountRecord[]
+      const w = whereAll(conditions)
+      return (w ? db.select().from(accounts).where(w) : db.select().from(accounts)).all() as AccountRecord[]
     },
 
     // ── Alerts ──────────────────────────────────────────────────────
@@ -253,12 +253,11 @@ export function createDatabase(path: string): Database {
     },
 
     listAlerts(filter?) {
-      let query = db.select().from(alerts).$dynamic()
-      const conditions = []
+      const conditions: SQL[] = []
       if (filter?.strategyId) conditions.push(eq(alerts.strategyId, filter.strategyId))
       if (filter?.type) conditions.push(eq(alerts.type, filter.type))
-      if (conditions.length === 1) query = query.where(conditions[0])
-      if (conditions.length > 1) query = query.where(and(...conditions))
+      const w = whereAll(conditions)
+      let query = (w ? db.select().from(alerts).where(w) : db.select().from(alerts)).$dynamic()
       if (filter?.limit) query = query.limit(filter.limit)
       return query.all() as AlertRecord[]
     },

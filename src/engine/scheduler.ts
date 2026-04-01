@@ -32,8 +32,8 @@ export class Scheduler {
         const killActive = await this.riskManager.isKillSwitchActive()
         if (killActive) return
         await entry.strategy.tick()
-      } catch {
-        // Isolated: log nothing, don't propagate
+      } catch (err) {
+        console.error(`[scheduler] Strategy ${strategyId} tick failed:`, (err as Error).message)
       }
     }
 

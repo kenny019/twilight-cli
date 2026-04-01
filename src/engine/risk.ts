@@ -174,5 +174,10 @@ export class RiskManagerImpl implements RiskManager {
 
   async recordTrade(strategyId: string, pnl: number): Promise<void> {
     this.trades.push({ strategyId, pnl, timestamp: Date.now() })
+    // Prune entries older than 30 days to prevent unbounded growth
+    if (this.trades.length > 10_000) {
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000
+      this.trades = this.trades.filter((t) => t.timestamp >= cutoff)
+    }
   }
 }

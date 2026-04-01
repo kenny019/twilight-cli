@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from 'node:fs'
+import { readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Strategy } from '../types/index.js'
 
@@ -13,8 +13,6 @@ export class StrategyLoader {
     const strategies: Strategy[] = []
 
     for (const dir of this.directories) {
-      if (!existsSync(dir)) continue
-
       let files: string[]
       try {
         files = readdirSync(dir).filter(f => f.endsWith('.ts') || f.endsWith('.js'))

@@ -45,9 +45,7 @@ export class LendingYieldStrategy implements Strategy {
         const accounts = await ctx.twilight.walletAccounts()
         const idleAccounts = accounts.filter(a => a.ioType === 'Coin')
 
-        for (const account of idleAccounts) {
-          await ctx.twilight.openLend(account.index)
-        }
+        await Promise.all(idleAccounts.map(a => ctx.twilight.openLend(a.index)))
       } else if (hasOpenPositions && apy < config.minApyThreshold) {
         // Close each open lend position
         for (const pos of openPositions) {
