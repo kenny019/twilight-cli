@@ -4,6 +4,7 @@ import { runSetupWizard } from './setup.js'
 export interface ProgramOptions {
   apiUrl?: string
   token?: string
+  exitOverride?: boolean
 }
 
 export function createProgram(options?: ProgramOptions): Command {
@@ -12,7 +13,7 @@ export function createProgram(options?: ProgramOptions): Command {
 
   const program = new Command()
   program.name('twilight-bots')
-  program.exitOverride()
+  if (options?.exitOverride) program.exitOverride()
 
   program
     .command('setup')

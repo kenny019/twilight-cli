@@ -5,7 +5,7 @@
   "type": "module",
   "main": "dist/server.js",
   "bin": {
-    "twilight-bots": "dist/cli/index.js"
+    "twilight-bots": "dist/cli/bin.js"
   },
   "scripts": {
     "build": "tsc",

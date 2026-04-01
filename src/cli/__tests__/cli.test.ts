@@ -72,7 +72,7 @@ describe('WS-10: CLI', () => {
 
   describe('Management commands call REST API', () => {
     it('status command calls GET /status', async () => {
-      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test' })
+      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test', exitOverride: true })
       await program.parseAsync(['node', 'twilight-bots', 'status'])
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/status',
@@ -85,7 +85,7 @@ describe('WS-10: CLI', () => {
     })
 
     it('start command calls POST /strategies/:id/start', async () => {
-      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test' })
+      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test', exitOverride: true })
       await program.parseAsync(['node', 'twilight-bots', 'start', 'funding-arb'])
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/strategies/funding-arb/start',
@@ -94,7 +94,7 @@ describe('WS-10: CLI', () => {
     })
 
     it('stop command calls POST /strategies/:id/stop', async () => {
-      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test' })
+      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test', exitOverride: true })
       await program.parseAsync(['node', 'twilight-bots', 'stop', 'funding-arb'])
       expect(mockFetch).toHaveBeenCalledWith(
         'http://localhost:3000/strategies/funding-arb/stop',
@@ -103,7 +103,7 @@ describe('WS-10: CLI', () => {
     })
 
     it('market command calls relayer-cli for market data', async () => {
-      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test' })
+      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test', exitOverride: true })
       // Market command may call the API or relayer-cli directly
       await program.parseAsync(['node', 'twilight-bots', 'market'])
       // Just verify it doesn't crash
@@ -114,7 +114,7 @@ describe('WS-10: CLI', () => {
   describe('Error handling', () => {
     it('handles connection errors gracefully', async () => {
       mockFetch.mockRejectedValue(new Error('ECONNREFUSED'))
-      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test' })
+      const program = createProgram({ apiUrl: 'http://localhost:3000', token: 'test', exitOverride: true })
 
       // Should not throw, should handle gracefully
       await expect(
