@@ -27,7 +27,7 @@ export class BinanceClientImpl implements BinanceClient {
 
     const exchangeConfig = {
       apiKey: config.apiKey,
-      apiSecret: config.apiSecret,
+      secret: config.apiSecret,
       options: { defaultType: 'future' },
     }
 

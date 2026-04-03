@@ -50,19 +50,44 @@ export class FundingArbStrategy implements Strategy {
       const hasOpenPositions = openPositions.length > 0
 
       if (!hasOpenPositions && differential > config.entryThreshold) {
-        const riskCheck = await ctx.risk.checkPreTrade(this.id, config.positionSizeSats, 0)
+        // Rate floor warning: fees and funding rates use different time horizons,
+        // so we warn rather than block (entryThreshold is the user's profitability gate)
+        const fees = await ctx.twilight.feeRate()
+        const roundTripFee = fees.marketFill + fees.marketSettle
+        if (differential < roundTripFee) {
+          ctx.log.warn('Differential below round-trip fees — trade may not be profitable', { differential, roundTripFee })
+        }
+
+        const { sats: totalBalance } = await ctx.twilight.walletBalance()
+        const riskCheck = await ctx.risk.checkPreTrade(this.id, config.positionSizeSats, totalBalance)
         if (!riskCheck.allowed) {
-          ctx.log.warn('Risk check blocked entry', { reason: riskCheck.reason })
+          ctx.log.warn('Risk check blocked entry', { control: riskCheck.control })
+          await ctx.alert.sendRiskAlert(this.id, riskCheck)
           return
         }
 
-        // Determine position size in BTC for Binance (positionSizeSats / 1e8 * price, simplified to 1 unit)
+        // Find idle Twilight account
+        const accounts = await ctx.twilight.walletAccounts()
+        const idleAccount = accounts.find(a => a.ioType === 'Coin')
+        if (!idleAccount) {
+          ctx.log.warn('No idle Twilight account available')
+          return
+        }
+
         const btcSize = config.positionSizeSats / 1e8
 
         const [twilightResult] = await Promise.all([
-          ctx.twilight.openTrade(0, 'LONG', price, 1),
+          ctx.twilight.openTrade(idleAccount.index, 'LONG', price, 1),
           ctx.binance.openPosition('SHORT', btcSize, 1),
         ])
+
+        // Track account usage in DB
+        ctx.db.createAccount({
+          exchange: 'twilight',
+          accountIndex: idleAccount.index,
+          status: 'active',
+          balance: config.positionSizeSats,
+        })
 
         const position = ctx.db.createPosition({
           strategyId: this.id,
@@ -85,6 +110,7 @@ export class FundingArbStrategy implements Strategy {
 
         await ctx.alert.sendTradeAlert(this.id, 'open', {
           twilightRequestId: twilightResult.requestId,
+          accountIndex: idleAccount.index,
           differential,
           price,
         })
@@ -92,10 +118,26 @@ export class FundingArbStrategy implements Strategy {
         const binancePosition = await ctx.binance.getPosition()
         const size = binancePosition?.size ?? 0
 
-        await Promise.all([
-          ctx.twilight.closeTrade(0),
-          ctx.binance.closePosition('SHORT', size),
-        ])
+        // Close Twilight positions — prefer DB-tracked accounts, fallback to wallet query
+        const trackedAccounts = ctx.db.listAccounts({ exchange: 'twilight', status: 'active' })
+        const closeOps: Promise<unknown>[] = []
+
+        if (trackedAccounts.length > 0) {
+          for (const acc of trackedAccounts) {
+            closeOps.push(ctx.twilight.closeTrade(acc.accountIndex))
+          }
+        } else {
+          const walletAccounts = await ctx.twilight.walletAccounts()
+          for (let i = 0; i < openPositions.length && i < walletAccounts.length; i++) {
+            closeOps.push(ctx.twilight.closeTrade(walletAccounts[i].index))
+          }
+        }
+        closeOps.push(ctx.binance.closePosition('SHORT', size))
+        await Promise.all(closeOps)
+
+        for (const acc of trackedAccounts) {
+          ctx.db.updateAccount(acc.id, { status: 'idle' })
+        }
 
         for (const pos of openPositions) {
           ctx.db.updatePosition(pos.id, { status: 'closed', closedAt: new Date().toISOString() })

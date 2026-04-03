@@ -2,7 +2,7 @@
  * Validation contract for WS-6: Risk Management
  * Tests define "done" — do not modify without orchestrator approval.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { existsSync, unlinkSync, mkdirSync } from 'fs'
 import { join } from 'path'
 import { tmpdir } from 'os'
@@ -101,12 +101,14 @@ describe('WS-6: Risk Management', () => {
     })
 
     it('rejects when exchange disconnected for >60s', async () => {
+      vi.useFakeTimers()
       risk.reportConnectionStatus('twilight', false)
       // Simulate 61 seconds passing
-      // The implementation should track disconnect timestamps
+      vi.advanceTimersByTime(61_000)
       const result = await risk.checkConnectionHealth('twilight')
       expect(result.allowed).toBe(false)
       expect(result.control).toBe('connectionWatchdog')
+      vi.useRealTimers()
     })
   })
 

@@ -42,17 +42,71 @@ export class LendingYieldStrategy implements Strategy {
       const hasOpenPositions = openPositions.length > 0
 
       if (!hasOpenPositions && apy >= config.minApyThreshold) {
+        // Open lend positions on idle accounts
         const accounts = await ctx.twilight.walletAccounts()
         const idleAccounts = accounts.filter(a => a.ioType === 'Coin')
 
-        await Promise.all(idleAccounts.map(a => ctx.twilight.openLend(a.index)))
+        for (const account of idleAccounts) {
+          await ctx.twilight.openLend(account.index)
+
+          // Track account in DB
+          ctx.db.createAccount({
+            exchange: 'twilight',
+            accountIndex: account.index,
+            status: 'active',
+            balance: account.balance,
+          })
+
+          ctx.db.createPosition({
+            strategyId: this.id,
+            exchange: 'twilight',
+            side: 'LONG',
+            entryPrice: 0,
+            size: account.balance,
+            leverage: 1,
+            status: 'open',
+          })
+        }
+
+        if (idleAccounts.length > 0) {
+          ctx.log.info('Opened lend positions', { count: idleAccounts.length, apy })
+          await ctx.alert.sendTradeAlert(this.id, 'open-lend', {
+            accounts: idleAccounts.length,
+            apy,
+          })
+        }
       } else if (hasOpenPositions && apy < config.minApyThreshold) {
-        // Close each open lend position
+        // Close lend positions — prefer DB-tracked accounts, fallback to wallet query
+        const trackedAccounts = ctx.db.listAccounts({ exchange: 'twilight', status: 'active' })
+
+        if (trackedAccounts.length > 0) {
+          for (const acc of trackedAccounts) {
+            await ctx.twilight.closeLend(acc.accountIndex)
+            ctx.db.updateAccount(acc.id, { status: 'idle' })
+          }
+        } else {
+          const walletAccounts = await ctx.twilight.walletAccounts()
+          for (let i = 0; i < openPositions.length && i < walletAccounts.length; i++) {
+            await ctx.twilight.closeLend(walletAccounts[i].index)
+          }
+        }
+
         for (const pos of openPositions) {
-          // accountIndex is not stored on PositionRecord; use 0 as the default zk-account index
-          const accountIndex = 0
-          await ctx.twilight.closeLend(accountIndex)
           ctx.db.updatePosition(pos.id, { status: 'closed', closedAt: new Date().toISOString() })
+        }
+
+        ctx.log.info('Closed lend positions', { count: openPositions.length, apy })
+        await ctx.alert.sendTradeAlert(this.id, 'close-lend', {
+          positions: openPositions.length,
+          apy,
+        })
+      } else if (hasOpenPositions && apy >= config.minApyThreshold) {
+        // Rebalance check: if APY dropped significantly, consider closing to re-enter later
+        const pool = await ctx.twilight.lendPool()
+        const currentApy = pool.apy
+        const apyDelta = Math.abs(currentApy - apy)
+        if (apyDelta > config.rebalanceThreshold) {
+          ctx.log.info('APY delta exceeds rebalance threshold', { apyDelta, threshold: config.rebalanceThreshold })
         }
       }
     } catch (err) {

@@ -9,8 +9,9 @@
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/server.ts",
-    "start": "node dist/server.js",
+    "dev": "node --env-file=.env --import tsx/esm src/server.ts",
+    "setup": "tsx src/cli/bin.ts setup",
+    "start": "node --env-file=.env dist/server.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src/",

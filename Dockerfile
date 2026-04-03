@@ -20,11 +20,11 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY --from=builder /app/dist ./dist
-
-# Copy relayer-cli binary if present
-COPY bin/ ./bin/ 2>/dev/null || true
+COPY bin/ ./bin/
 
 RUN mkdir -p /app/data
+
+ENV DATABASE_PATH=/app/data/twilight-bots.db
 
 EXPOSE 3000
 

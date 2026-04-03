@@ -1,4 +1,4 @@
-import type { RiskManager, RiskProfile, RiskCheckResult, RiskProfileConfig, Database } from '../types/index.js'
+import type { RiskManager, RiskProfile, RiskCheckResult, RiskProfileConfig, Database, AlertClient } from '../types/index.js'
 import { RISK_PROFILES, DAILY_LOSS_LIMIT_PCT } from '../types/index.js'
 
 interface TradeEntry {
@@ -16,12 +16,21 @@ function todayStart(): number {
 export class RiskManagerImpl implements RiskManager {
   private db: Database
   private profile: RiskProfileConfig
+  private alertClient?: AlertClient
   private trades: TradeEntry[] = []
   private connectionStatus: Map<string, { connected: boolean; disconnectedAt: number | null }> = new Map()
 
-  constructor(db: Database, profile: RiskProfile) {
+  constructor(db: Database, profile: RiskProfile, alertClient?: AlertClient) {
     this.db = db
     this.profile = RISK_PROFILES[profile]
+    this.alertClient = alertClient
+  }
+
+  private async alertOnReject(strategyId: string, result: RiskCheckResult): Promise<RiskCheckResult> {
+    if (!result.allowed && this.alertClient) {
+      this.alertClient.sendRiskAlert(strategyId, result).catch(() => {})
+    }
+    return result
   }
 
   async checkPreTrade(
@@ -30,12 +39,12 @@ export class RiskManagerImpl implements RiskManager {
     totalBalanceSats: number,
   ): Promise<RiskCheckResult> {
     if (await this.isKillSwitchActive()) {
-      return { allowed: false, control: 'killSwitch' }
+      return this.alertOnReject(strategyId, { allowed: false, control: 'killSwitch', reason: 'Kill switch is active' })
     }
 
     const cap = (this.profile.positionSizeCapPct / 100) * totalBalanceSats
     if (positionSizeSats > cap) {
-      return { allowed: false, control: 'positionSizeCap' }
+      return this.alertOnReject(strategyId, { allowed: false, control: 'positionSizeCap', reason: `Position ${positionSizeSats} exceeds cap ${cap}` })
     }
 
     return { allowed: true }
@@ -70,7 +79,7 @@ export class RiskManagerImpl implements RiskManager {
 
     const drawdownPct = (Math.abs(cumulativePnl) / initialBalance) * 100
     if (drawdownPct > this.profile.maxDrawdownPct) {
-      return { allowed: false, control: 'maxDrawdown' }
+      return this.alertOnReject(strategyId, { allowed: false, control: 'maxDrawdown', reason: `Drawdown ${drawdownPct.toFixed(2)}% exceeds max ${this.profile.maxDrawdownPct}%` })
     }
 
     return { allowed: true }
@@ -109,7 +118,7 @@ export class RiskManagerImpl implements RiskManager {
 
     const dailyLossPct = (Math.abs(totalDailyPnl) / totalBalance) * 100
     if (dailyLossPct > DAILY_LOSS_LIMIT_PCT) {
-      return { allowed: false, control: 'dailyLossLimit' }
+      return this.alertOnReject('system', { allowed: false, control: 'dailyLossLimit', reason: `Daily loss ${dailyLossPct.toFixed(2)}% exceeds limit ${DAILY_LOSS_LIMIT_PCT}%` })
     }
 
     return { allowed: true }
@@ -133,7 +142,7 @@ export class RiskManagerImpl implements RiskManager {
     const cooldownMs = this.profile.cooldownMinutes * 60 * 1000
     const elapsed = Date.now() - latest.timestamp
     if (elapsed < cooldownMs) {
-      return { allowed: false, control: 'cooldown' }
+      return this.alertOnReject(strategyId, { allowed: false, control: 'cooldown', reason: `Cooldown active: ${Math.round((cooldownMs - elapsed) / 1000)}s remaining` })
     }
 
     return { allowed: true }
@@ -142,12 +151,18 @@ export class RiskManagerImpl implements RiskManager {
   async checkConnectionHealth(exchange: string): Promise<RiskCheckResult> {
     const status = this.connectionStatus.get(exchange)
     if (!status) {
-      // Never reported — assume healthy
       return { allowed: true }
     }
 
-    if (!status.connected) {
-      return { allowed: false, control: 'connectionWatchdog' }
+    if (!status.connected && status.disconnectedAt !== null) {
+      const elapsed = Date.now() - status.disconnectedAt
+      if (elapsed > 60_000) {
+        return this.alertOnReject('system', {
+          allowed: false,
+          control: 'connectionWatchdog',
+          reason: `${exchange} disconnected for ${Math.round(elapsed / 1000)}s`,
+        })
+      }
     }
 
     return { allowed: true }

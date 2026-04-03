@@ -32,13 +32,26 @@ export class TwilightClientImpl implements TwilightClient {
     return ['--wallet-id', this.walletId, '--password', this.password]
   }
 
-  private async run(args: string[]): Promise<unknown> {
+  private async invoke(args: string[]): Promise<string> {
     try {
       const { stdout } = await execFileAsync(this.bin, args, {})
-      return JSON.parse(stdout)
+      return stdout
     } catch (err) {
       throw new Error(`relayer-cli failed: ${(err as Error).message}`, { cause: err })
     }
+  }
+
+  private async run(args: string[]): Promise<unknown> {
+    return JSON.parse(await this.invoke(args))
+  }
+
+  private parseTradeResult(stdout: string): TwilightTradeResult {
+    const txHash = stdout.match(/TX hash:\s*(\S+)/)?.[1]
+    const accountIndexStr = stdout.match(/Account index:\s*(\d+)/)?.[1]
+    if (!txHash || !accountIndexStr) {
+      throw new Error(`Failed to parse relayer-cli output: ${stdout.slice(0, 200)}`)
+    }
+    return { requestId: txHash, accountIndex: parseInt(accountIndexStr, 10), status: 'success' }
   }
 
   private mapTradeResult(raw: Record<string, unknown>): TwilightTradeResult {
@@ -109,59 +122,64 @@ export class TwilightClientImpl implements TwilightClient {
   // ─── Wallet operations ───────────────────────────────────────────
 
   async walletBalance(): Promise<{ nyks: number; sats: number }> {
-    const raw = await this.run([...this.walletFlags(), '--json', 'wallet', 'balance']) as {
-      nyks: number
-      sats: number
-    }
-    return { nyks: raw.nyks, sats: raw.sats }
+    const stdout = await this.invoke([...this.walletFlags(), 'wallet', 'balance'])
+    const nyks = parseInt(stdout.match(/NYKS:\s+(\d+)/)?.[1] ?? '0', 10)
+    const sats = parseInt(stdout.match(/SATS:\s+(\d+)/)?.[1] ?? '0', 10)
+    return { nyks, sats }
   }
 
   async walletAccounts(): Promise<TwilightAccount[]> {
-    const raw = await this.run([...this.walletFlags(), '--json', 'wallet', 'accounts']) as Array<{
-      index: number
-      balance: number
-      on_chain: boolean
-      io_type: string
-    }>
-    return raw.map(a => ({
-      index: a.index,
-      balance: a.balance,
-      onChain: a.on_chain,
-      ioType: a.io_type,
-    }))
+    const stdout = await this.invoke([...this.walletFlags(), 'wallet', 'accounts'])
+    if (stdout.includes('No ZkOS accounts found')) return []
+
+    const accounts: TwilightAccount[] = []
+    const lines = stdout.split('\n')
+    for (const line of lines) {
+      // Match table rows: INDEX  BALANCE  ON-CHAIN  IO-TYPE  ACCOUNT
+      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(true|false)\s+(\S+)\s+(\S+)/)
+      if (match) {
+        accounts.push({
+          index: parseInt(match[1], 10),
+          balance: parseInt(match[2], 10),
+          onChain: match[3] === 'true',
+          ioType: match[4],
+        })
+      }
+    }
+    return accounts
   }
 
   // ─── ZkAccount operations ────────────────────────────────────────
 
   async fund(amountSats: number): Promise<TwilightTradeResult> {
-    const raw = await this.run([
-      ...this.walletFlags(), '--json', 'zkaccount', 'fund', '--amount', String(amountSats),
-    ]) as Record<string, unknown>
-    return this.mapTradeResult(raw)
+    const stdout = await this.invoke([
+      ...this.walletFlags(), 'zkaccount', 'fund', '--amount', String(amountSats),
+    ])
+    return this.parseTradeResult(stdout)
   }
 
   async withdraw(accountIndex: number): Promise<TwilightTradeResult> {
-    const raw = await this.run([
-      ...this.walletFlags(), '--json', 'zkaccount', 'withdraw', '--account-index', String(accountIndex),
-    ]) as Record<string, unknown>
-    return this.mapTradeResult(raw)
+    const stdout = await this.invoke([
+      ...this.walletFlags(), 'zkaccount', 'withdraw', '--account-index', String(accountIndex),
+    ])
+    return this.parseTradeResult(stdout)
   }
 
   async transfer(fromAccountIndex: number): Promise<TwilightTradeResult> {
-    const raw = await this.run([
-      ...this.walletFlags(), '--json', 'zkaccount', 'transfer', '--from', String(fromAccountIndex),
-    ]) as Record<string, unknown>
-    return this.mapTradeResult(raw)
+    const stdout = await this.invoke([
+      ...this.walletFlags(), 'zkaccount', 'transfer', '--from', String(fromAccountIndex),
+    ])
+    return this.parseTradeResult(stdout)
   }
 
   async split(fromAccountIndex: number, balancesSats: number[]): Promise<TwilightTradeResult> {
-    const raw = await this.run([
+    const stdout = await this.invoke([
       ...this.walletFlags(),
-      '--json', 'zkaccount', 'split',
+      'zkaccount', 'split',
       '--from', String(fromAccountIndex),
       '--balances', balancesSats.join(','),
-    ]) as Record<string, unknown>
-    return this.mapTradeResult(raw)
+    ])
+    return this.parseTradeResult(stdout)
   }
 
   // ─── Order operations ────────────────────────────────────────────
@@ -246,7 +264,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async openLend(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      ...this.walletFlags(), '--json', 'lend', 'open',
+      ...this.walletFlags(), '--json', 'order', 'open-lend',
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
@@ -254,7 +272,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async closeLend(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      ...this.walletFlags(), '--json', 'lend', 'close',
+      ...this.walletFlags(), '--json', 'order', 'close-lend',
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
@@ -262,7 +280,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async queryLend(accountIndex: number): Promise<Record<string, unknown>> {
     return this.run([
-      ...this.walletFlags(), '--json', 'lend', 'query',
+      ...this.walletFlags(), '--json', 'order', 'query-lend',
       '--account-index', String(accountIndex),
     ]) as Promise<Record<string, unknown>>
   }

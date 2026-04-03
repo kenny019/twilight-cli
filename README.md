@@ -2,7 +2,7 @@
 
 CLI-first trading bot platform for [Twilight Protocol](https://twilight.finance) and Binance. Run automated strategies, deploy to Railway with one click.
 
-Ships with two template strategies (funding rate arbitrage + lending yield), 7 risk controls, Discord alerts, and a REST API for remote management.
+Ships with two template strategies (funding rate arbitrage + lending yield), 7 risk controls, Discord alerts, graceful shutdown, and a REST API for remote management.
 
 ## Quick Start
 
@@ -13,19 +13,22 @@ npm install
 # Run the interactive setup wizard
 npx twilight-bots setup
 
-# Start the bot locally
+# Start the bot (API server + strategy engine)
 npm run dev
 ```
 
-The setup wizard walks through 5 steps:
+The setup wizard walks through 6 steps:
 
-1. **Twilight Wallet** -- create a new wallet or import an existing mnemonic
-2. **Binance API Keys** -- API key + secret (Spot + Futures permissions required)
-3. **Discord Alerts** -- webhook URL for trade notifications
-4. **Strategy Selection** -- choose from `funding-arb` and `lending-yield`
-5. **Risk Profile** -- conservative, moderate, or aggressive
+1. **relayer-cli binary** -- download, build from source, or provide path to existing binary
+2. **Twilight Wallet** -- create a new wallet or import an existing mnemonic
+3. **Binance API Keys** -- API key + secret (Spot + Futures permissions required)
+4. **Discord Alerts** -- webhook URL for trade notifications (optional)
+5. **Strategy Selection** -- choose from `funding-arb` and `lending-yield`
+6. **Risk Profile** -- conservative, moderate, or aggressive
 
 Output: `twilight-bots.config.json` with all settings + an auto-generated Bearer token.
+
+On startup, the server reads the config, creates exchange clients, loads enabled strategies, and starts the tick loop. Strategies run automatically -- the REST API is for monitoring and remote control.
 
 ## Strategies
 
@@ -70,9 +73,10 @@ All risk controls are active from day one. Profile defaults:
 | Daily loss limit | 5% | 5% | 5% |
 
 Additional controls:
-- **Connection watchdog** -- pauses strategies if an exchange is unreachable
+- **Connection watchdog** -- pauses strategies if an exchange is unreachable for >60 seconds
 - **Kill switch** -- emergency stop all strategies, persists across restarts
-- **Rate floor** -- funding arb won't enter if rate < fee cost + minimum profit
+- **Rate floor** -- funding arb warns when rate differential < round-trip fee cost
+- **Alert integration** -- every risk rejection fires a Discord alert (or logs to console if no webhook)
 
 ## Deployment
 
@@ -90,6 +94,8 @@ BINANCE_API_SECRET=your_api_secret
 DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
 BEARER_TOKEN=your_secret_token
 PORT=3000
+DATABASE_PATH=/app/data/twilight-bots.db
+RELAYER_PROGRAM_JSON_PATH=/app/bin/relayerprogram.json
 ```
 
 ### Docker Compose (VPS / local)
@@ -107,10 +113,16 @@ Data is persisted in a Docker volume at `/app/data`.
 
 ```bash
 npm install
-npm run dev      # Starts with tsx (hot reload)
+npm run dev      # Starts server + strategies with tsx
 npm run build    # Compile TypeScript
 npm start        # Run compiled output
 ```
+
+The `DATABASE_PATH` env var controls where SQLite data is stored (default: `twilight-bots.db` in CWD). `RELAYER_PROGRAM_JSON_PATH` points to the ZkOS circuit parameters file required by relayer-cli.
+
+### Graceful Shutdown
+
+The server handles `SIGTERM` and `SIGINT`: stops all strategy ticks, closes exchange connections, then exits. This ensures no trades are left in a partial state during deploys or restarts.
 
 ## CLI Commands
 
@@ -186,12 +198,12 @@ The strategy engine auto-discovers files in `strategies/templates/` and `strateg
 ```
 twilight-bots/
 ├── src/
-│   ├── server.ts              # Hono REST API
+│   ├── server.ts              # REST API + bootstrap (clients, strategies, shutdown)
 │   ├── cli/                   # CLI (commander + inquirer setup wizard)
 │   ├── engine/
-│   │   ├── scheduler.ts       # Cron-based tick loop with strategy isolation
+│   │   ├── scheduler.ts       # Interval-based tick loop with strategy isolation
 │   │   ├── loader.ts          # Auto-discovers strategy files
-│   │   └── risk.ts            # 7 risk controls
+│   │   └── risk.ts            # 7 risk controls + Discord alert integration
 │   ├── exchanges/
 │   │   ├── twilight.ts        # Wraps relayer-cli via execFile
 │   │   └── binance.ts         # Wraps ccxt (USD-M Futures)
@@ -201,6 +213,9 @@ twilight-bots/
 │   ├── alerts/
 │   │   └── discord.ts         # Webhook notifications with rate limiting
 │   ├── db/                    # SQLite via Drizzle ORM
+│   ├── utils/
+│   │   ├── logger.ts          # Structured console logger
+│   │   └── exec.ts            # Async child_process wrapper
 │   └── types/                 # All shared interfaces
 ├── Dockerfile                 # Multi-stage Node 20 Alpine
 ├── docker-compose.yml         # Local/VPS deployment

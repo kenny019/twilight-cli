@@ -93,43 +93,62 @@ describe('WS-3: Twilight Client', () => {
   })
 
   describe('Wallet operations', () => {
-    it('fetches wallet balance', async () => {
-      mockSuccess(JSON.stringify({ nyks: 1000, sats: 50000 }))
+    it('fetches wallet balance from plain text', async () => {
+      mockSuccess('Wallet Balance\n  Address:  twilight1abc\n  NYKS:     1000\n  SATS:     50000\n')
       const balance = await client.walletBalance()
-      expect(balance).toHaveProperty('nyks')
-      expect(balance).toHaveProperty('sats')
+      expect(balance).toEqual({ nyks: 1000, sats: 50000 })
+      expect(mockExecFileAsync).toHaveBeenCalledWith(
+        './bin/relayer-cli',
+        expect.not.arrayContaining(['--json']),
+        expect.any(Object),
+      )
     })
 
-    it('lists wallet accounts', async () => {
-      mockSuccess(JSON.stringify([
-        { index: 0, balance: 50000, on_chain: true, io_type: 'Coin' },
-        { index: 1, balance: 30000, on_chain: true, io_type: 'Memo' },
-      ]))
+    it('lists wallet accounts from plain-text table', async () => {
+      mockSuccess(
+        'INDEX    BALANCE      ON-CHAIN   IO-TYPE    ACCOUNT\n' +
+        '------------------------------------------------------------------------------------------\n' +
+        '0        50000        true       Coin       abc123\n' +
+        '1        30000        true       Memo       def456\n',
+      )
       const accounts = await client.walletAccounts()
       expect(accounts).toHaveLength(2)
-      expect(accounts[0]).toHaveProperty('index')
-      expect(accounts[0]).toHaveProperty('balance')
+      expect(accounts[0]).toEqual({ index: 0, balance: 50000, onChain: true, ioType: 'Coin' })
+      expect(accounts[1]).toEqual({ index: 1, balance: 30000, onChain: true, ioType: 'Memo' })
+    })
+
+    it('returns empty array when no accounts found', async () => {
+      mockSuccess('No ZkOS accounts found\n')
+      const accounts = await client.walletAccounts()
+      expect(accounts).toEqual([])
     })
   })
 
   describe('ZkAccount operations', () => {
-    it('funds a new ZkOS account', async () => {
-      mockSuccess(JSON.stringify({ request_id: 'REQ123', account_index: 2, status: 'success' }))
+    const fundOutput = 'Funding 10000 sats to new ZkOS trading account...\nFunding successful\n  TX hash: ABC123\n  TX code: 0\n  Account index: 2\n'
+
+    it('funds a new ZkOS account from plain text', async () => {
+      mockSuccess(fundOutput)
       const result = await client.fund(10000)
-      expect(result.requestId).toBeTruthy()
-      expect(result.status).toBe('success')
+      expect(result).toEqual({ requestId: 'ABC123', accountIndex: 2, status: 'success' })
+      expect(mockExecFileAsync).toHaveBeenCalledWith(
+        './bin/relayer-cli',
+        expect.not.arrayContaining(['--json']),
+        expect.any(Object),
+      )
     })
 
     it('withdraws from a ZkOS account', async () => {
-      mockSuccess(JSON.stringify({ request_id: 'REQ456', account_index: 0, status: 'success' }))
+      mockSuccess('Withdrawing...\n  TX hash: DEF456\n  TX code: 0\n  Account index: 0\n')
       const result = await client.withdraw(0)
-      expect(result.requestId).toBeTruthy()
+      expect(result.requestId).toBe('DEF456')
+      expect(result.status).toBe('success')
     })
 
     it('transfers (rotates) an account', async () => {
-      mockSuccess(JSON.stringify({ request_id: 'REQ789', account_index: 3, status: 'success' }))
+      mockSuccess('Transferring...\n  TX hash: GHI789\n  TX code: 0\n  Account index: 3\n')
       const result = await client.transfer(0)
-      expect(result.requestId).toBeTruthy()
+      expect(result.requestId).toBe('GHI789')
       expect(mockExecFileAsync).toHaveBeenCalledWith(
         './bin/relayer-cli',
         expect.arrayContaining(['zkaccount', 'transfer', '--from', '0']),
@@ -138,9 +157,9 @@ describe('WS-3: Twilight Client', () => {
     })
 
     it('splits an account into multiple', async () => {
-      mockSuccess(JSON.stringify({ request_id: 'REQ000', account_index: 0, status: 'success' }))
+      mockSuccess('Splitting...\n  TX hash: JKL000\n  TX code: 0\n  Account index: 0\n')
       const result = await client.split(0, [2000, 3000, 5000])
-      expect(result.requestId).toBeTruthy()
+      expect(result.requestId).toBe('JKL000')
       expect(mockExecFileAsync).toHaveBeenCalledWith(
         './bin/relayer-cli',
         expect.arrayContaining(['zkaccount', 'split', '--from', '0', '--balances', '2000,3000,5000']),
@@ -173,14 +192,14 @@ describe('WS-3: Twilight Client', () => {
     })
 
     it('closes a trade and auto-rotates account', async () => {
-      // First call: close-trade. Second call: zkaccount transfer (rotation)
+      // First call: close-trade (JSON). Second call: zkaccount transfer (plain text)
       let callCount = 0
       mockExecFileAsync.mockImplementation(async () => {
         callCount++
         if (callCount === 1) {
           return { stdout: JSON.stringify({ request_id: 'REQ_CLOSE', account_index: 0, status: 'SETTLED' }), stderr: '' }
         } else {
-          return { stdout: JSON.stringify({ request_id: 'REQ_ROT', account_index: 4, status: 'success' }), stderr: '' }
+          return { stdout: 'Transferring...\n  TX hash: REQ_ROT\n  TX code: 0\n  Account index: 4\n', stderr: '' }
         }
       })
 
@@ -220,22 +239,37 @@ describe('WS-3: Twilight Client', () => {
   })
 
   describe('Lending operations', () => {
-    it('opens a lend order', async () => {
+    it('opens a lend order via order open-lend', async () => {
       mockSuccess(JSON.stringify({ request_id: 'REQ_LEND', account_index: 0, status: 'success' }))
       const result = await client.openLend(0)
       expect(result.requestId).toBeTruthy()
+      expect(mockExecFileAsync).toHaveBeenCalledWith(
+        './bin/relayer-cli',
+        expect.arrayContaining(['order', 'open-lend']),
+        expect.any(Object),
+      )
     })
 
-    it('closes a lend order', async () => {
+    it('closes a lend order via order close-lend', async () => {
       mockSuccess(JSON.stringify({ request_id: 'REQ_CLEND', account_index: 0, status: 'success' }))
       const result = await client.closeLend(0)
       expect(result.requestId).toBeTruthy()
+      expect(mockExecFileAsync).toHaveBeenCalledWith(
+        './bin/relayer-cli',
+        expect.arrayContaining(['order', 'close-lend']),
+        expect.any(Object),
+      )
     })
 
-    it('queries lend status', async () => {
+    it('queries lend status via order query-lend', async () => {
       mockSuccess(JSON.stringify({ uuid: 'LEND123', status: 'ACTIVE' }))
       const result = await client.queryLend(0)
       expect(result).toHaveProperty('uuid')
+      expect(mockExecFileAsync).toHaveBeenCalledWith(
+        './bin/relayer-cli',
+        expect.arrayContaining(['order', 'query-lend']),
+        expect.any(Object),
+      )
     })
   })
 
@@ -257,7 +291,7 @@ describe('WS-3: Twilight Client', () => {
     })
 
     it('passes wallet-id and password flags', async () => {
-      mockSuccess(JSON.stringify({ nyks: 100, sats: 5000 }))
+      mockSuccess('Wallet Balance\n  NYKS:     100\n  SATS:     5000\n')
       await client.walletBalance()
       expect(mockExecFileAsync).toHaveBeenCalledWith(
         './bin/relayer-cli',
