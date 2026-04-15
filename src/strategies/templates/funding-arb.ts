@@ -1,4 +1,6 @@
 import type { Strategy, StrategyConfig, StrategyInfo, Context } from '../../types/index.js'
+import type { ProposableStrategy, TradeProposal, AgentEvaluation } from '../../types/agent.js'
+import { DEFAULT_EVALUATION } from '../../types/agent.js'
 
 interface FundingArbConfig {
   entryThreshold: number
@@ -7,7 +9,7 @@ interface FundingArbConfig {
   checkIntervalMs: number
 }
 
-export class FundingArbStrategy implements Strategy {
+export class FundingArbStrategy implements Strategy, ProposableStrategy {
   id = 'funding-arb'
   name = 'Funding Rate Arbitrage'
   description = 'Delta-neutral funding rate arbitrage between Twilight and Binance'
@@ -23,7 +25,7 @@ export class FundingArbStrategy implements Strategy {
     required: ['entryThreshold', 'exitThreshold', 'positionSizeSats', 'checkIntervalMs'],
   }
 
-  private config!: FundingArbConfig
+  config!: FundingArbConfig
   private ctx!: Context
   private tickCount = 0
   private errorCount = 0
@@ -36,7 +38,67 @@ export class FundingArbStrategy implements Strategy {
   }
 
   async tick(): Promise<void> {
-    const { ctx, config } = this
+    const proposal = await this.propose(this.ctx)
+    if (!proposal) {
+      this.tickCount++
+      this.lastTick = new Date().toISOString()
+      return
+    }
+    await this.execute(this.ctx, DEFAULT_EVALUATION)
+  }
+
+  async propose(ctx: Context): Promise<TradeProposal | null> {
+    try {
+      const [twilightRate, binanceRate, price] = await Promise.all([
+        ctx.twilight.fundingRate(),
+        ctx.binance.getFundingRate(),
+        ctx.twilight.marketPrice(),
+      ])
+
+      const differential = Math.abs(binanceRate - twilightRate)
+      const openPositions = ctx.db.listPositions({ strategyId: this.id, status: 'open' })
+      const hasOpenPositions = openPositions.length > 0
+
+      const snapshot = {
+        price,
+        twilightFundingRate: twilightRate,
+        binanceFundingRate: binanceRate,
+        differential,
+        timestamp: new Date().toISOString(),
+      }
+
+      if (!hasOpenPositions && differential > this.config.entryThreshold) {
+        return {
+          strategyId: this.id,
+          action: 'open',
+          side: 'LONG',
+          sizeSats: this.config.positionSizeSats,
+          entryPrice: price,
+          leverage: 1,
+          reason: `Funding differential ${differential.toFixed(6)} exceeds entry threshold ${this.config.entryThreshold}`,
+          marketSnapshot: snapshot,
+        }
+      }
+
+      if (hasOpenPositions && differential < this.config.exitThreshold) {
+        return {
+          strategyId: this.id,
+          action: 'close',
+          reason: `Funding differential ${differential.toFixed(6)} below exit threshold ${this.config.exitThreshold}`,
+          marketSnapshot: snapshot,
+        }
+      }
+
+      return null
+    } catch (err) {
+      this.errorCount++
+      ctx.log.error('propose error', { error: String(err) })
+      throw err
+    }
+  }
+
+  async execute(ctx: Context, evaluation: AgentEvaluation): Promise<void> {
+    const { config } = this
 
     try {
       const [twilightRate, binanceRate, price] = await Promise.all([
@@ -49,9 +111,11 @@ export class FundingArbStrategy implements Strategy {
       const openPositions = ctx.db.listPositions({ strategyId: this.id, status: 'open' })
       const hasOpenPositions = openPositions.length > 0
 
+      // Use adjusted params if agent provided them
+      const positionSizeSats = (evaluation.adjustedParams?.positionSizeSats as number) ?? config.positionSizeSats
+
       if (!hasOpenPositions && differential > config.entryThreshold) {
-        // Rate floor warning: fees and funding rates use different time horizons,
-        // so we warn rather than block (entryThreshold is the user's profitability gate)
+        // Rate floor warning
         const fees = await ctx.twilight.feeRate()
         const roundTripFee = fees.marketFill + fees.marketSettle
         if (differential < roundTripFee) {
@@ -59,14 +123,13 @@ export class FundingArbStrategy implements Strategy {
         }
 
         const { sats: totalBalance } = await ctx.twilight.walletBalance()
-        const riskCheck = await ctx.risk.checkPreTrade(this.id, config.positionSizeSats, totalBalance)
+        const riskCheck = await ctx.risk.checkPreTrade(this.id, positionSizeSats, totalBalance)
         if (!riskCheck.allowed) {
           ctx.log.warn('Risk check blocked entry', { control: riskCheck.control })
           await ctx.alert.sendRiskAlert(this.id, riskCheck)
           return
         }
 
-        // Find idle Twilight account
         const accounts = await ctx.twilight.walletAccounts()
         const idleAccount = accounts.find(a => a.ioType === 'Coin')
         if (!idleAccount) {
@@ -74,19 +137,18 @@ export class FundingArbStrategy implements Strategy {
           return
         }
 
-        const btcSize = config.positionSizeSats / 1e8
+        const btcSize = positionSizeSats / 1e8
 
         const [twilightResult] = await Promise.all([
           ctx.twilight.openTrade(idleAccount.index, 'LONG', price, 1),
           ctx.binance.openPosition('SHORT', btcSize, 1),
         ])
 
-        // Track account usage in DB
         ctx.db.createAccount({
           exchange: 'twilight',
           accountIndex: idleAccount.index,
           status: 'active',
-          balance: config.positionSizeSats,
+          balance: positionSizeSats,
         })
 
         const position = ctx.db.createPosition({
@@ -94,7 +156,7 @@ export class FundingArbStrategy implements Strategy {
           exchange: 'twilight',
           side: 'LONG',
           entryPrice: price,
-          size: config.positionSizeSats,
+          size: positionSizeSats,
           leverage: 1,
           status: 'open',
         })
@@ -103,7 +165,7 @@ export class FundingArbStrategy implements Strategy {
           positionId: position.id,
           type: 'open',
           price,
-          size: config.positionSizeSats,
+          size: positionSizeSats,
           fee: 0,
           pnl: 0,
         })
@@ -118,7 +180,6 @@ export class FundingArbStrategy implements Strategy {
         const binancePosition = await ctx.binance.getPosition()
         const size = binancePosition?.size ?? 0
 
-        // Close Twilight positions — prefer DB-tracked accounts, fallback to wallet query
         const trackedAccounts = ctx.db.listAccounts({ exchange: 'twilight', status: 'active' })
         const closeOps: Promise<unknown>[] = []
 
@@ -143,11 +204,23 @@ export class FundingArbStrategy implements Strategy {
           ctx.db.updatePosition(pos.id, { status: 'closed', closedAt: new Date().toISOString() })
         }
 
+        // Record outcome in journal
+        ctx.journal?.recordOutcome({
+          type: 'outcome',
+          timestamp: new Date().toISOString(),
+          strategyId: this.id,
+          evaluationTimestamp: new Date().toISOString(),
+          pnl: 0, // PnL tracked via DB trades
+          holdDurationMs: 0,
+          exitReason: `differential below exit threshold (${differential})`,
+          metrics: { differential, exitPrice: price },
+        })
+
         ctx.log.info('Closed delta-neutral position', { differential })
       }
     } catch (err) {
       this.errorCount++
-      ctx.log.error('tick error', { error: String(err) })
+      ctx.log.error('execute error', { error: String(err) })
       throw err
     } finally {
       this.tickCount++

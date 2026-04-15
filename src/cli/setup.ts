@@ -376,11 +376,11 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
   console.log('\n  Twilight Bots — Setup Wizard\n')
 
   // Step 1: Ensure relayer-cli binary
-  console.log('  Step 1/6: relayer-cli binary')
+  console.log('  Step 1/7: relayer-cli binary')
   const binaryPath = await ensureBinary(options?.dryRun)
 
   // Step 2: Wallet setup
-  console.log('  Step 2/6: Twilight Wallet')
+  console.log('  Step 2/7: Twilight Wallet')
 
   // Check for existing wallets so we can offer to reuse them
   const existingWallets = await listExistingWallets(binaryPath)
@@ -481,7 +481,7 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
   }
 
   // Step 3: Binance API keys (required for funding-arb hedge leg; optional for lending-yield)
-  console.log('  Step 3/6: Binance API Keys')
+  console.log('  Step 3/7: Binance API Keys')
   console.log('  Needed for funding-arb (hedge leg on Binance Futures). Press Enter to skip.\n')
   const binanceAnswers = await inquirer.prompt([
     { type: 'input', name: 'apiKey', message: 'Binance API key (optional):' },
@@ -521,7 +521,7 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
   }
 
   // Step 4: Discord webhook
-  console.log('  Step 4/6: Discord Alerts')
+  console.log('  Step 4/7: Discord Alerts')
   const discordAnswers = await inquirer.prompt([
     { type: 'input', name: 'webhookUrl', message: 'Discord webhook URL (optional, press Enter to skip):' },
   ])
@@ -551,7 +551,7 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
   }
 
   // Step 5: Strategy selection
-  console.log('  Step 5/6: Strategy Selection')
+  console.log('  Step 5/7: Strategy Selection')
   const hasBinance = !!(binanceAnswers.apiKey?.trim() && binanceAnswers.apiSecret?.trim())
   const strategyChoices = [
     ...(hasBinance ? [{ name: 'funding-arb', value: 'funding-arb', checked: true }] : []),
@@ -568,7 +568,7 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
   ])
 
   // Step 6: Risk profile
-  console.log('  Step 6/6: Risk Profile')
+  console.log('  Step 6/7: Risk Profile')
   const riskAnswers = await inquirer.prompt([
     {
       type: 'list',
@@ -577,6 +577,71 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
       choices: ['conservative', 'moderate', 'aggressive'],
     },
   ])
+
+  // Step 7: AI Agent (Optional)
+  console.log('  Step 7/7: AI Agent (Optional)')
+  const { enableAgent } = await inquirer.prompt([
+    { type: 'confirm', name: 'enableAgent', message: 'Enable AI agent evaluation?', default: false },
+  ])
+
+  let agentConfig: AppConfig['agent'] | undefined
+  if (enableAgent) {
+    const agentAnswers = await inquirer.prompt([
+      {
+        type: 'list',
+        name: 'provider',
+        message: 'LLM provider:',
+        choices: ['anthropic', 'openai', 'google'],
+        default: 'anthropic',
+      },
+      {
+        type: 'password',
+        name: 'apiKey',
+        message: 'API key:',
+        validate: (input: string) => input.length > 0 || 'API key cannot be empty',
+      },
+      {
+        type: 'input',
+        name: 'model',
+        message: 'Model:',
+        default: 'claude-sonnet-4-20250514',
+      },
+      {
+        type: 'number',
+        name: 'cadence',
+        message: 'Evaluation cadence (ms):',
+        default: 300000,
+      },
+      {
+        type: 'number',
+        name: 'maxCalls',
+        message: 'Max calls/hour:',
+        default: 60,
+      },
+      {
+        type: 'number',
+        name: 'maxTokens',
+        message: 'Max tokens/day:',
+        default: 500000,
+      },
+    ])
+
+    agentConfig = {
+      enabled: true,
+      provider: agentAnswers.provider,
+      model: agentAnswers.model,
+      apiKey: agentAnswers.apiKey,
+      evaluationCadenceMs: agentAnswers.cadence,
+      evaluationTimeoutMs: 10000,
+      confidenceThreshold: 2.0,
+      revertThreshold: 1.0,
+      budget: {
+        maxCallsPerHour: agentAnswers.maxCalls,
+        maxTokensPerDay: agentAnswers.maxTokens,
+      },
+      journalPath: 'agent-journal.jsonl',
+    }
+  }
 
   const config: AppConfig = {
     twilight: {
@@ -597,6 +662,7 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
       port: 3000,
       bearerToken: crypto.randomUUID(),
     },
+    ...(agentConfig ? { agent: agentConfig } : {}),
   }
 
   if (!options?.dryRun) {
@@ -611,6 +677,9 @@ export async function runSetupWizard(options?: SetupOptions): Promise<AppConfig>
   console.log(`  Risk profile:      ${config.riskProfile}`)
   console.log(`  API port:          ${config.server.port}`)
   console.log(`  Bearer token:      ${config.server.bearerToken}`)
+  if (config.agent?.enabled) {
+    console.log(`  AI Agent:          enabled (${config.agent.provider}/${config.agent.model})`)
+  }
   console.log(`\n  Next: run "npm run dev" to start the bot.\n`)
 
   return config

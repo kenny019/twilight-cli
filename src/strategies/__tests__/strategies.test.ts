@@ -6,6 +6,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { FundingArbStrategy } from '../templates/funding-arb.js'
 import { LendingYieldStrategy } from '../templates/lending-yield.js'
 import type { Strategy, Context, TwilightClient, BinanceClient, RiskManager, AlertClient, Logger, Database } from '../../types/index.js'
+import type { ProposableStrategy, AgentEvaluation } from '../../types/agent.js'
 
 function createMockContext(): Context {
   return {
@@ -199,6 +200,59 @@ describe('WS-9: Template Strategies', () => {
       expect(info.id).toBe(strategy.id)
       expect(['active', 'stopped', 'error']).toContain(info.status)
     })
+
+    describe('propose/execute split', () => {
+      it('implements ProposableStrategy interface', () => {
+        const proposable = strategy as unknown as ProposableStrategy
+        expect(typeof proposable.propose).toBe('function')
+        expect(typeof proposable.execute).toBe('function')
+      })
+
+      it('propose returns TradeProposal when differential exceeds threshold', async () => {
+        ;(ctx.twilight.fundingRate as any).mockResolvedValue(0.0)
+        ;(ctx.binance.getFundingRate as any).mockResolvedValue(0.0005)
+
+        const proposable = strategy as unknown as Strategy & ProposableStrategy
+        const proposal = await proposable.propose(ctx)
+
+        expect(proposal).not.toBeNull()
+        expect(proposal!.action).toBe('open')
+        expect(proposal!.strategyId).toBe('funding-arb')
+        expect(proposal!.marketSnapshot.differential).toBeGreaterThan(0)
+      })
+
+      it('propose returns null when no action needed', async () => {
+        ;(ctx.twilight.fundingRate as any).mockResolvedValue(0.0)
+        ;(ctx.binance.getFundingRate as any).mockResolvedValue(0.00005) // below threshold
+
+        const proposable = strategy as unknown as Strategy & ProposableStrategy
+        const proposal = await proposable.propose(ctx)
+
+        expect(proposal).toBeNull()
+      })
+
+      it('execute opens positions with approve evaluation', async () => {
+        ;(ctx.twilight.fundingRate as any).mockResolvedValue(0.0)
+        ;(ctx.binance.getFundingRate as any).mockResolvedValue(0.0005)
+
+        const evaluation: AgentEvaluation = { verdict: 'approve', confidence: 0.9, reasoning: 'test' }
+        const proposable = strategy as unknown as Strategy & ProposableStrategy
+        await proposable.execute(ctx, evaluation)
+
+        expect(ctx.twilight.openTrade).toHaveBeenCalled()
+        expect(ctx.binance.openPosition).toHaveBeenCalled()
+      })
+
+      it('tick() calls propose then execute (backward compat)', async () => {
+        ;(ctx.twilight.fundingRate as any).mockResolvedValue(0.0)
+        ;(ctx.binance.getFundingRate as any).mockResolvedValue(0.0005)
+
+        await strategy.tick()
+
+        expect(ctx.twilight.openTrade).toHaveBeenCalled()
+        expect(ctx.binance.openPosition).toHaveBeenCalled()
+      })
+    })
   })
 
   describe('LendingYieldStrategy', () => {
@@ -272,6 +326,48 @@ describe('WS-9: Template Strategies', () => {
     it('returns valid status', () => {
       const info = strategy.status()
       expect(info.id).toBe(strategy.id)
+    })
+
+    describe('propose/execute split', () => {
+      it('implements ProposableStrategy interface', () => {
+        const proposable = strategy as unknown as ProposableStrategy
+        expect(typeof proposable.propose).toBe('function')
+        expect(typeof proposable.execute).toBe('function')
+      })
+
+      it('propose returns TradeProposal when APY above minimum', async () => {
+        ;(ctx.twilight.lastDayApy as any).mockResolvedValue(18.0)
+
+        const proposable = strategy as unknown as Strategy & ProposableStrategy
+        const proposal = await proposable.propose(ctx)
+
+        expect(proposal).not.toBeNull()
+        expect(proposal!.action).toBe('open')
+        expect(proposal!.strategyId).toBe('lending-yield')
+      })
+
+      it('propose returns null when APY below minimum and no positions', async () => {
+        ;(ctx.twilight.lastDayApy as any).mockResolvedValue(5.0)
+        ;(ctx.db.listPositions as any).mockReturnValue([])
+
+        const proposable = strategy as unknown as Strategy & ProposableStrategy
+        const proposal = await proposable.propose(ctx)
+
+        expect(proposal).toBeNull()
+      })
+
+      it('execute opens lend positions with approve evaluation', async () => {
+        ;(ctx.twilight.lastDayApy as any).mockResolvedValue(18.0)
+        ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+          { index: 0, balance: 50000, onChain: true, ioType: 'Coin' },
+        ])
+
+        const evaluation: AgentEvaluation = { verdict: 'approve', confidence: 0.9, reasoning: 'test' }
+        const proposable = strategy as unknown as Strategy & ProposableStrategy
+        await proposable.execute(ctx, evaluation)
+
+        expect(ctx.twilight.openLend).toHaveBeenCalled()
+      })
     })
   })
 })

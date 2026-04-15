@@ -6,14 +6,16 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { Scheduler } from '../scheduler.js'
 import { StrategyLoader } from '../loader.js'
 import type { Strategy, StrategyConfig, StrategyInfo, Context, RiskManager } from '../../types/index.js'
+import type { ProposableStrategy, AgentEvaluator, AgentEvaluation, TradeProposal, Journal, AgentStatus, MarketSnapshot } from '../../types/agent.js'
 
 // Helper: create a mock strategy
-function createMockStrategy(overrides: Partial<Strategy> = {}): Strategy {
+function createMockStrategy(overrides: Partial<Strategy> = {}): Strategy & { config: Record<string, unknown> } {
   return {
     id: 'mock-strategy',
     name: 'Mock Strategy',
     description: 'A mock strategy for testing',
     configSchema: {},
+    config: { entryThreshold: 0.001 },
     init: vi.fn().mockResolvedValue(undefined),
     tick: vi.fn().mockResolvedValue(undefined),
     stop: vi.fn().mockResolvedValue(undefined),
@@ -171,6 +173,161 @@ describe('WS-7: Strategy Engine', () => {
       const statuses = scheduler.getStatuses()
       expect(statuses).toHaveLength(1)
       expect(statuses[0].id).toBe('mock-strategy')
+    })
+
+    describe('Agent evaluation path', () => {
+      function createMockProposableStrategy(): Strategy & ProposableStrategy {
+        const base = createMockStrategy()
+        return {
+          ...base,
+          propose: vi.fn().mockResolvedValue({
+            strategyId: 'mock-strategy',
+            action: 'open',
+            side: 'LONG',
+            sizeSats: 50000,
+            entryPrice: 65000,
+            leverage: 1,
+            reason: 'test proposal',
+            marketSnapshot: {
+              price: 65000,
+              twilightFundingRate: 0,
+              binanceFundingRate: 0.0005,
+              differential: 0.0005,
+              timestamp: new Date().toISOString(),
+            },
+          } as TradeProposal),
+          execute: vi.fn().mockResolvedValue(undefined),
+        }
+      }
+
+      function createMockAgent(evaluation?: Partial<AgentEvaluation>): AgentEvaluator {
+        return {
+          evaluate: vi.fn().mockResolvedValue({
+            verdict: 'approve',
+            confidence: 0.9,
+            reasoning: 'test approval',
+            ...evaluation,
+          }),
+          detectRegime: vi.fn().mockResolvedValue({ regime: 'quiet', confidence: 1 }),
+          status: vi.fn().mockReturnValue({
+            enabled: true,
+            lastEvaluation: null,
+            lastRegimeCheck: null,
+            currentRegime: null,
+            evaluationCount: 0,
+            callsThisHour: 0,
+            budgetRemaining: { calls: 60, tokens: 500000 },
+          } as AgentStatus),
+        }
+      }
+
+      function createMockJournal(): Journal {
+        return {
+          recordEvaluation: vi.fn(),
+          recordOutcome: vi.fn(),
+          recordAdjustment: vi.fn(),
+          getEntries: vi.fn().mockReturnValue([]),
+          getConfidenceScore: vi.fn().mockReturnValue(null),
+          getSummary: vi.fn().mockReturnValue(''),
+          reconstruct: vi.fn(),
+          flush: vi.fn(),
+        }
+      }
+
+      it('calls propose + execute when strategy is proposable and agent is present', async () => {
+        const strategy = createMockProposableStrategy()
+        const agent = createMockAgent()
+        const journal = createMockJournal()
+        const ctx = { agent, journal } as unknown as Context
+
+        await scheduler.register(strategy, { interval: 1000 }, ctx)
+        await scheduler.start(strategy.id)
+
+        await vi.advanceTimersByTimeAsync(1000)
+
+        expect(strategy.propose).toHaveBeenCalledWith(ctx)
+        expect(agent.evaluate).toHaveBeenCalled()
+        expect(strategy.execute).toHaveBeenCalledWith(ctx, expect.objectContaining({ verdict: 'approve' }))
+        expect(journal.recordEvaluation).toHaveBeenCalled()
+      })
+
+      it('does not execute when agent rejects proposal', async () => {
+        const strategy = createMockProposableStrategy()
+        const agent = createMockAgent({ verdict: 'reject', confidence: 0.8 })
+        const journal = createMockJournal()
+        const ctx = { agent, journal } as unknown as Context
+
+        await scheduler.register(strategy, { interval: 1000 }, ctx)
+        await scheduler.start(strategy.id)
+
+        await vi.advanceTimersByTimeAsync(1000)
+
+        expect(strategy.propose).toHaveBeenCalled()
+        expect(agent.evaluate).toHaveBeenCalled()
+        expect(strategy.execute).not.toHaveBeenCalled()
+      })
+
+      it('falls back to tick() when evaluation has confidence 0 (timeout)', async () => {
+        const strategy = createMockProposableStrategy()
+        const agent = createMockAgent({ confidence: 0, reasoning: 'timeout fallback' })
+        const journal = createMockJournal()
+        const ctx = { agent, journal } as unknown as Context
+
+        await scheduler.register(strategy, { interval: 1000 }, ctx)
+        await scheduler.start(strategy.id)
+
+        await vi.advanceTimersByTimeAsync(1000)
+
+        expect(strategy.tick).toHaveBeenCalled()
+        expect(strategy.execute).not.toHaveBeenCalled()
+      })
+
+      it('records adjustment when verdict is adjust', async () => {
+        const strategy = createMockProposableStrategy()
+        const adjustedParams = { entryThreshold: 0.002 }
+        const agent = createMockAgent({ verdict: 'adjust', adjustedParams })
+        const journal = createMockJournal()
+        const ctx = { agent, journal } as unknown as Context
+
+        await scheduler.register(strategy, { interval: 1000 }, ctx)
+        await scheduler.start(strategy.id)
+
+        await vi.advanceTimersByTimeAsync(1000)
+
+        expect(journal.recordAdjustment).toHaveBeenCalledWith(
+          expect.objectContaining({ type: 'adjustment', status: 'applied' }),
+        )
+        expect(strategy.execute).toHaveBeenCalled()
+      })
+
+      it('skips when propose returns null', async () => {
+        const strategy = createMockProposableStrategy()
+        ;(strategy.propose as any).mockResolvedValue(null)
+        const agent = createMockAgent()
+        const journal = createMockJournal()
+        const ctx = { agent, journal } as unknown as Context
+
+        await scheduler.register(strategy, { interval: 1000 }, ctx)
+        await scheduler.start(strategy.id)
+
+        await vi.advanceTimersByTimeAsync(1000)
+
+        expect(agent.evaluate).not.toHaveBeenCalled()
+        expect(strategy.execute).not.toHaveBeenCalled()
+      })
+
+      it('falls back to tick() when no agent in context', async () => {
+        const strategy = createMockProposableStrategy()
+        const ctx = {} as unknown as Context
+
+        await scheduler.register(strategy, { interval: 1000 }, ctx)
+        await scheduler.start(strategy.id)
+
+        await vi.advanceTimersByTimeAsync(1000)
+
+        expect(strategy.tick).toHaveBeenCalled()
+        expect(strategy.propose).not.toHaveBeenCalled()
+      })
     })
   })
 

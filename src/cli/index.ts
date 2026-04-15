@@ -91,5 +91,48 @@ export function createProgram(options?: ProgramOptions): Command {
       console.log('logs command — not yet implemented')
     })
 
+  // ─── Sandbox commands ──────────────────────────────────────────
+  const sandbox = program
+    .command('sandbox')
+    .description('Run strategy backtests in sandbox mode')
+    .option('--data <path>', 'Path to market data CSV/JSON file')
+    .option('--strategy <id>', 'Strategy ID to test (e.g. funding-arb)')
+    .option('--dry-run', 'Skip LLM calls, use mock evaluator', false)
+    .option('--cache-dir <path>', 'Cache directory for LLM responses')
+    .action(async (opts) => {
+      // Default action: alias for `sandbox run`
+      if (opts.data && opts.strategy) {
+        const { runSandbox } = await import('../sandbox/cli-handler.js')
+        await runSandbox(opts)
+      } else {
+        sandbox.outputHelp()
+      }
+    })
+
+  sandbox
+    .command('run')
+    .description('Run sandbox replay against historical data')
+    .requiredOption('--data <path>', 'Path to market data CSV/JSON file')
+    .requiredOption('--strategy <id>', 'Strategy ID to test (e.g. funding-arb)')
+    .option('--dry-run', 'Skip LLM calls, use mock evaluator', false)
+    .option('--cache-dir <path>', 'Cache directory for LLM responses')
+    .action(async (opts) => {
+      const { runSandbox } = await import('../sandbox/cli-handler.js')
+      await runSandbox(opts)
+    })
+
+  sandbox
+    .command('fetch')
+    .description('Fetch historical market data')
+    .requiredOption('--symbol <pair>', 'Trading pair (e.g. BTC/USDT)')
+    .requiredOption('--from <date>', 'Start date (YYYY-MM-DD)')
+    .requiredOption('--to <date>', 'End date (YYYY-MM-DD)')
+    .requiredOption('--twilight-api <url>', 'Twilight API endpoint')
+    .requiredOption('--output <path>', 'Output CSV file path')
+    .action(async (opts) => {
+      const { runFetch } = await import('../sandbox/cli-handler.js')
+      await runFetch(opts)
+    })
+
   return program
 }

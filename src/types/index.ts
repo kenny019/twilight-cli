@@ -1,3 +1,26 @@
+export type {
+  TradeProposal,
+  MarketSnapshot,
+  AgentVerdict,
+  AgentEvaluation,
+  MarketRegime,
+  AgentEvaluator,
+  AgentStatus,
+  Journal,
+  JournalEntry,
+  EvaluationEntry,
+  OutcomeEntry,
+  AdjustmentEntry,
+  ProposableStrategy,
+  AgentConfig,
+  MarketDataPoint,
+  SandboxConfig,
+  SandboxReport,
+  TwilightHistoricalFundingRate,
+} from './agent.js'
+
+export { DEFAULT_EVALUATION, isProposable, applyAdjustedParams } from './agent.js'
+
 // ─── Strategy Types ──────────────────────────────────────────────
 
 export type StrategyType = 'template' | 'custom'
@@ -45,6 +68,7 @@ export interface AppConfig {
     port: number
     bearerToken: string
   }
+  agent?: import('./agent.js').AgentConfig
 }
 
 // ─── Exchange Client Interfaces ──────────────────────────────────
@@ -290,6 +314,8 @@ export interface Context {
   log: Logger
   db: Database
   alert: AlertClient
+  agent?: import('./agent.js').AgentEvaluator
+  journal?: import('./agent.js').Journal
 }
 
 export interface Strategy {

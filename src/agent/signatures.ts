@@ -1,0 +1,21 @@
+import { f } from '@ax-llm/ax'
+
+export const evaluateProposalSig = f()
+  .description('Evaluate a trade proposal and decide whether to approve, reject, or adjust it')
+  .input('proposalJson', f.string('JSON-serialized trade proposal with strategy, action, side, size, entry, leverage, reason'))
+  .input('journalSummary', f.string('Compact summary of recent evaluations and outcomes for this strategy'))
+  .input('currentRegime', f.string('Current market regime: trending, ranging, volatile, or quiet'))
+  .output('reasoning', f.string('Step-by-step reasoning for the verdict').internal())
+  .output('verdict', f.class(['approve', 'reject', 'adjust'], 'Trade verdict'))
+  .output('confidence', f.number('Self-assessed confidence from 0 to 1').min(0).max(1))
+  .output('verdictReasoning', f.string('Concise explanation of the verdict'))
+  .output('adjustedParams', f.string('JSON of adjusted parameters when verdict is adjust, empty string otherwise').optional())
+  .build()
+
+export const detectRegimeSig = f()
+  .description('Detect the current market regime from a snapshot of market data')
+  .input('snapshotJson', f.string('JSON-serialized market snapshot with price, funding rates, differential, lending APY'))
+  .output('reasoning', f.string('Step-by-step analysis of market conditions').internal())
+  .output('regime', f.class(['trending', 'ranging', 'volatile', 'quiet'], 'Detected market regime'))
+  .output('confidence', f.number('Confidence in the regime detection from 0 to 1').min(0).max(1))
+  .build()

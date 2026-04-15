@@ -13,6 +13,7 @@ import { DiscordAlertClient } from './alerts/discord.js'
 import { FundingArbStrategy } from './strategies/templates/funding-arb.js'
 import { LendingYieldStrategy } from './strategies/templates/lending-yield.js'
 import { createLogger } from './utils/logger.js'
+import { applyAdjustedParams } from './types/agent.js'
 import type {
   AppConfig,
   AlertClient,
@@ -23,6 +24,8 @@ import type {
   StrategyConfig,
   Context,
   Database,
+  AgentEvaluator,
+  Journal,
 } from './types/index.js'
 
 export interface SchedulerLike {
@@ -36,6 +39,8 @@ export interface AppDeps {
   scheduler: SchedulerLike
   db: Database
   startTime: number
+  ctx?: Context
+  strategies?: Map<string, Strategy>
 }
 
 export function createApp(deps: AppDeps) {
@@ -126,6 +131,45 @@ export function createApp(deps: AppDeps) {
     return c.json(deps.db.listAlerts({ strategyId: id }))
   })
 
+  // ── GET /agent/status ─────────────────────────────────────────
+  app.get('/agent/status', (c) => {
+    if (!deps.ctx?.agent) return c.json({ enabled: false })
+    return c.json(deps.ctx.agent.status())
+  })
+
+  // ── GET /agent/journal ────────────────────────────────────────
+  app.get('/agent/journal', (c) => {
+    if (!deps.ctx?.journal) return c.json([])
+    const strategyId = c.req.query('strategyId')
+    const limit = c.req.query('limit') ? parseInt(c.req.query('limit')!, 10) : 50
+    return c.json(deps.ctx.journal.getEntries({ strategyId: strategyId ?? undefined, limit }))
+  })
+
+  // ── POST /agent/override ─────────────────────────────────────
+  app.post('/agent/override', async (c) => {
+    if (!deps.ctx?.journal) return c.json({ error: 'Agent not enabled' }, 400)
+    const { strategyId, params } = await c.req.json()
+    if (!strategyId || typeof strategyId !== 'string') return c.json({ error: 'strategyId required' }, 400)
+    if (!params || typeof params !== 'object') return c.json({ error: 'params object required' }, 400)
+
+    const liveStrategy = deps.strategies?.get(strategyId)
+    const previousParams = liveStrategy ? applyAdjustedParams(liveStrategy, params) : {}
+
+    deps.ctx.journal.recordAdjustment({
+      type: 'adjustment',
+      timestamp: new Date().toISOString(),
+      strategyId,
+      previousParams,
+      newParams: params,
+      reasoning: 'manual override via API',
+      confidence: 1,
+      status: 'persisted',
+    })
+    // Write merged config to DB so it survives restart
+    deps.db.updateStrategy(strategyId, { config: JSON.stringify({ ...previousParams, ...params }) })
+    return c.json({ ok: true })
+  })
+
   return app
 }
 
@@ -163,7 +207,7 @@ if (!process.env.VITEST) {
   startServer()
 }
 
-function startServer() {
+async function startServer() {
   const configPath = 'twilight-bots.config.json'
   let config: AppConfig
   try {
@@ -194,7 +238,20 @@ function startServer() {
   const riskManager = new RiskManagerImpl(db, config.riskProfile, alertClient)
   const scheduler = new Scheduler(riskManager)
 
-  const ctx: Context = { twilight, binance, risk: riskManager, log, db, alert: alertClient }
+  // Agent + Journal initialization
+  let agentEvaluator: AgentEvaluator | undefined
+  let journal: Journal | undefined
+  if (config.agent?.enabled) {
+    const { JournalImpl } = await import('./agent/journal/index.js')
+    const { AxAgentEvaluator } = await import('./agent/evaluator.js')
+    journal = new JournalImpl(config.agent.journalPath)
+    journal.reconstruct()
+    agentEvaluator = new AxAgentEvaluator(config.agent, { twilight, binance }, db)
+    log.info('Agent initialized', { provider: config.agent.provider, model: config.agent.model })
+  }
+
+  const ctx: Context = { twilight, binance, risk: riskManager, log, db, alert: alertClient, agent: agentEvaluator, journal }
+  const liveStrategies = new Map<string, Strategy>()
 
   async function loadStrategies(): Promise<void> {
     // Resolve configs first so we can prefund accounts before strategy init
@@ -224,7 +281,8 @@ function startServer() {
       const record = db.getStrategy(id)
 
       await strategy.init(strategyConfig, ctx)
-      await scheduler.register(strategy, { interval: (strategyConfig.checkIntervalMs as number) ?? 60000 })
+      await scheduler.register(strategy, { interval: (strategyConfig.checkIntervalMs as number) ?? 60000 }, ctx)
+      liveStrategies.set(id, strategy)
 
       if (!record) {
         db.createStrategy({ name: strategy.name, type: 'template', status: 'active', config: JSON.stringify(strategyConfig) })
@@ -238,7 +296,8 @@ function startServer() {
     const customStrategies = await loader.loadAll()
     for (const strategy of customStrategies) {
       await strategy.init({}, ctx)
-      await scheduler.register(strategy, { interval: 60000 })
+      await scheduler.register(strategy, { interval: 60000 }, ctx)
+      liveStrategies.set(strategy.id, strategy)
       await scheduler.start(strategy.id)
       log.info('Custom strategy started', { id: strategy.id, name: strategy.name })
     }
@@ -268,6 +327,8 @@ function startServer() {
     scheduler,
     db,
     startTime: Date.now(),
+    ctx,
+    strategies: liveStrategies,
   })
 
   const port = config.server.port ?? 3000

@@ -13,6 +13,14 @@ vi.mock('inquirer', () => ({
   },
 }))
 
+// Mock execFileAsync to avoid calling real relayer-cli binary in tests
+vi.mock('../../utils/exec.js', () => ({
+  execFileAsync: vi.fn().mockResolvedValue({
+    stdout: 'Wallet ID: default\nAddress: tw1abc\nBTC address: bc1abc\n',
+    stderr: '',
+  }),
+}))
+
 // Mock fetch for REST API calls
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
@@ -45,28 +53,50 @@ describe('WS-10: CLI', () => {
       expect(commandNames).toContain('wallet')
       expect(commandNames).toContain('market')
       expect(commandNames).toContain('logs')
+      expect(commandNames).toContain('sandbox')
+    })
+
+    it('sandbox command has run and fetch subcommands', () => {
+      const program = createProgram()
+      const sandbox = program.commands.find((c: any) => c.name() === 'sandbox')
+      expect(sandbox).toBeDefined()
+
+      const subcommandNames = sandbox!.commands.map((c: any) => c.name())
+      expect(subcommandNames).toContain('run')
+      expect(subcommandNames).toContain('fetch')
     })
   })
 
   describe('Setup wizard', () => {
-    it('runs through all 5 steps and writes config', async () => {
+    it('runs through all steps and writes config', async () => {
       const mockPrompt = vi.mocked(inquirer.prompt)
-      // Step 1: Wallet
+      // Step 1: Binary — ensureBinary may prompt useExisting if bin/relayer-cli is present
+      mockPrompt.mockResolvedValueOnce({ useExisting: true })
+      // Step 2: Wallet action
       mockPrompt.mockResolvedValueOnce({ walletAction: 'create' })
-      // Step 2: Binance
+      // Wallet password
+      mockPrompt.mockResolvedValueOnce({ walletPassword: 'test-pw' })
+      // Confirm password (shown for non-existing wallets)
+      mockPrompt.mockResolvedValueOnce({ walletPasswordConfirm: 'test-pw' })
+      // Wallet name
+      mockPrompt.mockResolvedValueOnce({ walletName: 'default' })
+      // Step 3: Binance
       mockPrompt.mockResolvedValueOnce({ apiKey: 'test-key', apiSecret: 'test-secret' })
-      // Step 3: Discord
+      // Step 4: Discord
       mockPrompt.mockResolvedValueOnce({ webhookUrl: 'https://discord.com/api/webhooks/123/abc' })
-      // Step 4: Strategy selection
+      // Step 5: Strategy selection
       mockPrompt.mockResolvedValueOnce({ strategies: ['funding-arb', 'lending-yield'] })
-      // Step 5: Risk profile
+      // Step 6: Risk profile
       mockPrompt.mockResolvedValueOnce({ riskProfile: 'moderate' })
+      // Step 7: Agent (skip)
+      mockPrompt.mockResolvedValueOnce({ enableAgent: false })
 
       const config = await runSetupWizard({ dryRun: true })
       expect(config).toBeDefined()
       expect(config.binance.apiKey).toBe('test-key')
       expect(config.strategies).toContain('funding-arb')
       expect(config.riskProfile).toBe('moderate')
+      expect(config.agent).toBeUndefined()
     })
   })
 
