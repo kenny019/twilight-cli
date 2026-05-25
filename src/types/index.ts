@@ -59,6 +59,11 @@ export interface AppConfig {
     apiKey: string
     apiSecret: string
   }
+  hyperliquid?: {
+    privateKey: string
+    accountAddress: string
+    testnet?: boolean
+  }
   discord: {
     webhookUrl: string
   }
@@ -171,6 +176,49 @@ export interface BinanceClient {
   watchFundingRate(callback: (rate: number) => void): Promise<() => void>
   // Lifecycle
   close(): Promise<void>
+}
+
+export interface HyperliquidPosition {
+  coin: string
+  side: OrderSide
+  entryPrice: number
+  size: number       // base currency (BTC)
+  leverage: number
+  unrealizedPnl: number
+  liquidationPrice: number | null
+}
+
+export interface HyperliquidOrderResult {
+  orderId: number | null
+  status: 'filled' | 'resting' | 'error'
+  fillPrice: number  // averaged for the round
+  size: number       // base currency (BTC)
+  fee: number        // USDC
+  raw: Record<string, unknown>
+}
+
+export interface HyperliquidFundingEntry {
+  time: number
+  coin: string
+  usdc: number      // signed
+  szi: number       // signed position size at funding time
+  fundingRate: number
+}
+
+export interface HyperliquidClient {
+  // Market data
+  getMarkPrice(coin?: string): Promise<number>
+  getFundingRate(coin?: string): Promise<number>
+  // Trading (size in BTC; quantized to step internally — caller may pre-quantize)
+  openPosition(side: OrderSide, sizeBtc: number, leverage: number): Promise<HyperliquidOrderResult>
+  closePosition(side: OrderSide, sizeBtc: number): Promise<HyperliquidOrderResult>
+  getPosition(coin?: string): Promise<HyperliquidPosition | null>
+  // Account
+  getBalance(): Promise<number>  // USDC
+  // Funding history
+  getRealizedFunding(sinceMs: number, coin?: string): Promise<HyperliquidFundingEntry[]>
+  // Helpers
+  quantizeBtcSize(sats: number, markPrice: number): number
 }
 
 // ─── Risk Manager ────────────────────────────────────────────────
@@ -317,6 +365,7 @@ export interface StrategyInfo {
 export interface Context {
   twilight: TwilightClient
   binance: BinanceClient
+  hyperliquid?: HyperliquidClient
   risk: RiskManager
   log: Logger
   db: Database
