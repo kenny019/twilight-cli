@@ -9,6 +9,7 @@ import { ensureZkAccounts } from './engine/prefund.js'
 import { StrategyLoader } from './engine/loader.js'
 import { TwilightClientImpl } from './exchanges/twilight.js'
 import { BinanceClientImpl } from './exchanges/binance.js'
+import { HyperliquidClientImpl } from './exchanges/hyperliquid.js'
 import { DiscordAlertClient } from './alerts/discord.js'
 import { FundingArbStrategy } from './strategies/templates/funding-arb.js'
 import { LendingYieldStrategy } from './strategies/templates/lending-yield.js'
@@ -41,6 +42,7 @@ export interface AppDeps {
   startTime: number
   ctx?: Context
   strategies?: Map<string, Strategy>
+  risk?: import('./types/index.js').RiskManager
 }
 
 export function createApp(deps: AppDeps) {
@@ -117,6 +119,32 @@ export function createApp(deps: AppDeps) {
     return c.json({ ok: true })
   })
 
+  // ── POST /strategies/:id/disable (per-strategy soft killswitch) ─
+  app.post('/strategies/:id/disable', async (c) => {
+    const id = c.req.param('id')
+    const strategy = deps.strategies?.get(id)
+    if (!strategy) return c.json({ error: 'Strategy not found in memory' }, 404)
+    const writable = strategy as unknown as { disabled?: boolean }
+    if (typeof writable.disabled !== 'boolean') {
+      return c.json({ error: 'Strategy does not support per-strategy disable' }, 400)
+    }
+    writable.disabled = true
+    return c.json({ ok: true, disabled: true })
+  })
+
+  // ── POST /strategies/:id/enable ─────────────────────────────────
+  app.post('/strategies/:id/enable', async (c) => {
+    const id = c.req.param('id')
+    const strategy = deps.strategies?.get(id)
+    if (!strategy) return c.json({ error: 'Strategy not found in memory' }, 404)
+    const writable = strategy as unknown as { disabled?: boolean }
+    if (typeof writable.disabled !== 'boolean') {
+      return c.json({ error: 'Strategy does not support per-strategy enable' }, 400)
+    }
+    writable.disabled = false
+    return c.json({ ok: true, disabled: false })
+  })
+
   // ── PUT /strategies/:id/config ──────────────────────────────────
   app.put('/strategies/:id/config', async (c) => {
     const id = c.req.param('id')
@@ -143,6 +171,20 @@ export function createApp(deps: AppDeps) {
     const strategyId = c.req.query('strategyId')
     const limit = c.req.query('limit') ? parseInt(c.req.query('limit')!, 10) : 50
     return c.json(deps.ctx.journal.getEntries({ strategyId: strategyId ?? undefined, limit }))
+  })
+
+  // ── POST /kill-switch ─────────────────────────────────────────
+  app.post('/kill-switch', async (c) => {
+    if (!deps.risk) return c.json({ error: 'Risk manager unavailable' }, 500)
+    await deps.risk.activateKillSwitch()
+    return c.json({ ok: true, killSwitch: 'active' })
+  })
+
+  // ── POST /kill-switch/release ─────────────────────────────────
+  app.post('/kill-switch/release', async (c) => {
+    if (!deps.risk) return c.json({ error: 'Risk manager unavailable' }, 500)
+    await deps.risk.deactivateKillSwitch()
+    return c.json({ ok: true, killSwitch: 'inactive' })
   })
 
   // ── POST /agent/override ─────────────────────────────────────
@@ -191,10 +233,16 @@ const TEMPLATE_STRATEGIES: Record<string, new () => Strategy> = {
 
 const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
   'funding-arb': {
-    entryThreshold: 0.001,
-    exitThreshold: 0.0003,
-    positionSizeSats: 100000,
-    checkIntervalMs: 60000,
+    entryThreshold: 0.01,
+    exitThreshold: 0.002,
+    positionSizeSats: 13_000,
+    checkIntervalMs: 300_000,
+    dedicatedAccountIndices: [2, 3],
+    maxConsecutiveFailures: 3,
+    minHoldUntilNextFundingMs: 600_000,
+    maxHoldMs: 86_400_000,
+    hyperliquidLeverage: 1,
+    hyperliquidMarginBufferUsdc: 5,
   },
   'lending-yield': {
     minApyThreshold: 5,
@@ -222,6 +270,12 @@ async function startServer() {
 
   const twilight = new TwilightClientImpl(config.twilight)
   const binance = new BinanceClientImpl(config.binance)
+  const hyperliquid = config.hyperliquid
+    ? new HyperliquidClientImpl(config.hyperliquid)
+    : undefined
+  if (!hyperliquid) {
+    log.warn('Hyperliquid config missing — funding-arb will be inert')
+  }
 
   let alertClient: AlertClient
   if (config.discord?.webhookUrl) {
@@ -250,7 +304,7 @@ async function startServer() {
     log.info('Agent initialized', { provider: config.agent.provider, model: config.agent.model })
   }
 
-  const ctx: Context = { twilight, binance, risk: riskManager, log, db, alert: alertClient, agent: agentEvaluator, journal }
+  const ctx: Context = { twilight, binance, hyperliquid, risk: riskManager, log, db, alert: alertClient, agent: agentEvaluator, journal }
   const liveStrategies = new Map<string, Strategy>()
 
   async function loadStrategies(): Promise<void> {
@@ -329,6 +383,7 @@ async function startServer() {
     startTime: Date.now(),
     ctx,
     strategies: liveStrategies,
+    risk: riskManager,
   })
 
   const port = config.server.port ?? 3000

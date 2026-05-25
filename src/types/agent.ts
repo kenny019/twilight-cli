@@ -16,7 +16,9 @@ export interface MarketSnapshot {
   price: number
   twilightFundingRate: number
   binanceFundingRate: number
-  differential: number
+  hyperliquidFundingRate?: number
+  signedDifferential?: number   // signed: twilightRate - hedgeRate (used by funding-arb)
+  differential: number          // absolute differential
   lendingApy?: number
   timestamp: string
 }
