@@ -13,6 +13,7 @@ import { HyperliquidClientImpl } from './exchanges/hyperliquid.js'
 import { DiscordAlertClient } from './alerts/discord.js'
 import { FundingArbStrategy } from './strategies/templates/funding-arb.js'
 import { LendingYieldStrategy } from './strategies/templates/lending-yield.js'
+import { MarketMakerStrategy } from './strategies/templates/market-maker.js'
 import { createLogger } from './utils/logger.js'
 import { applyAdjustedParams } from './types/agent.js'
 import type {
@@ -229,6 +230,7 @@ function buildConsoleAlertClient(logger: Logger): AlertClient {
 const TEMPLATE_STRATEGIES: Record<string, new () => Strategy> = {
   'funding-arb': FundingArbStrategy,
   'lending-yield': LendingYieldStrategy,
+  'market-maker': MarketMakerStrategy,
 }
 
 const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
@@ -249,6 +251,26 @@ const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
     rebalanceThreshold: 2,
     checkIntervalMs: 300000,
   },
+  'market-maker': {
+    layers: 1,
+    layerStepBps: 20,
+    quoteSizeSats: 9_000,
+    requoteIntervalMs: 600_000,
+    requoteBps: 50,
+    maxQuoteAgeMs: 1_800_000,
+    leverage: 1,
+    maxInventorySats: 27_000,
+    walletFloorSats: 60_000,
+    bypassCooldown: true,
+    minNyks: 1000,
+  },
+}
+
+function tickIntervalForStrategy(id: string, cfg: StrategyConfig): number {
+  if (id === 'market-maker') {
+    return (cfg.requoteIntervalMs as number) ?? 60_000
+  }
+  return (cfg.checkIntervalMs as number) ?? 60_000
 }
 
 if (!process.env.VITEST) {
@@ -335,7 +357,7 @@ async function startServer() {
       const record = db.getStrategy(id)
 
       await strategy.init(strategyConfig, ctx)
-      await scheduler.register(strategy, { interval: (strategyConfig.checkIntervalMs as number) ?? 60000 }, ctx)
+      await scheduler.register(strategy, { interval: tickIntervalForStrategy(id, strategyConfig) }, ctx)
       liveStrategies.set(id, strategy)
 
       if (!record) {

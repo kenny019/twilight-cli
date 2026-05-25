@@ -1,5 +1,8 @@
 import type { Context, StrategyConfig } from '../types/index.js'
 
+const SPLIT_POLL_INTERVAL_MS = 2000
+const SPLIT_POLL_TIMEOUT_MS = 60_000
+
 export async function ensureZkAccounts(
   ctx: Context,
   strategies: string[],
@@ -7,10 +10,9 @@ export async function ensureZkAccounts(
 ): Promise<void> {
   const log = ctx.log
 
-  const accounts = await ctx.twilight.walletAccounts()
-  const idleAccounts = accounts.filter(a => a.ioType === 'Coin')
+  let accounts = await ctx.twilight.walletAccounts()
+  const idleAccounts = () => accounts.filter(a => a.ioType === 'Coin' && a.onChain)
 
-  // Check if each enabled strategy already has a usable idle account
   const needed: Array<{ strategy: string; amount: number }> = []
 
   for (const id of strategies) {
@@ -19,18 +21,77 @@ export async function ensureZkAccounts(
 
     if (id === 'funding-arb') {
       const size = (cfg.positionSizeSats as number) ?? 0
-      const has = idleAccounts.some(a => a.balance >= size)
+      const has = idleAccounts().some(a => a.balance >= size)
       if (has) {
         log.info('funding-arb: idle account with sufficient balance exists')
       } else {
         needed.push({ strategy: id, amount: size })
       }
     } else if (id === 'lending-yield') {
-      const has = idleAccounts.some(a => a.balance > 0)
+      const has = idleAccounts().some(a => a.balance > 0)
       if (has) {
         log.info('lending-yield: idle account exists')
       } else {
-        needed.push({ strategy: id, amount: 0 }) // 0 = use remaining balance
+        needed.push({ strategy: id, amount: 0 })
+      }
+    } else if (id === 'market-maker') {
+      const layers = Math.max(1, (cfg.layers as number) ?? 2)
+      const quoteSize = (cfg.quoteSizeSats as number) ?? 10_000
+      const required = layers * 2
+      const usable = idleAccounts().filter(a => a.balance >= quoteSize).length
+      if (usable >= required) {
+        log.info('market-maker: sufficient Coin accounts available', { usable, required })
+        continue
+      }
+
+      // Sync nonce before any chain-mutating operation. The method is only
+      // present on the real client; mocks expose no-op or are absent.
+      const syncNonce = (ctx.twilight as { syncNonce?: () => Promise<void> }).syncNonce
+      if (typeof syncNonce === 'function') {
+        try {
+          await syncNonce.call(ctx.twilight)
+        } catch (err) {
+          log.warn('sync-nonce failed — continuing', { error: (err as Error).message })
+        }
+      }
+
+      const deficit = required - usable
+      const fundAmount = deficit * quoteSize
+
+      const { sats } = await ctx.twilight.walletBalance()
+      if (sats < fundAmount) {
+        log.warn('Wallet sats below required prefund amount', { sats, fundAmount })
+        continue
+      }
+
+      try {
+        log.info('market-maker: funding parent ZkOS account', { fundAmount, deficit, quoteSize })
+        const fundResult = await ctx.twilight.fund(fundAmount)
+        const parentIndex = fundResult.accountIndex
+        const balances = Array(deficit).fill(quoteSize)
+        log.info('market-maker: splitting parent into quote accounts', { parentIndex, balances })
+        await ctx.twilight.split(parentIndex, balances)
+
+        // Poll until child accounts appear; non-blocking on timeout.
+        const startedAt = Date.now()
+        while (Date.now() - startedAt < SPLIT_POLL_TIMEOUT_MS) {
+          await new Promise<void>(r => setTimeout(r, SPLIT_POLL_INTERVAL_MS))
+          accounts = await ctx.twilight.walletAccounts()
+          const usableNow = idleAccounts().filter(a => a.balance >= quoteSize).length
+          if (usableNow >= required) {
+            log.info('market-maker: prefund complete', { usableNow })
+            break
+          }
+        }
+
+        const finalUsable = (await ctx.twilight.walletAccounts()).filter(
+          a => a.ioType === 'Coin' && a.onChain && a.balance >= quoteSize,
+        ).length
+        if (finalUsable < required) {
+          log.warn('market-maker: child accounts did not finalize before timeout', { finalUsable, required })
+        }
+      } catch (err) {
+        log.error('market-maker prefund failed', { error: (err as Error).message })
       }
     }
   }
@@ -40,13 +101,14 @@ export async function ensureZkAccounts(
     return
   }
 
-  const { sats } = await ctx.twilight.walletBalance()
-  if (sats === 0) {
+  // Refresh in case market-maker prefund consumed wallet sats above.
+  const balance = await ctx.twilight.walletBalance()
+  if (balance.sats === 0) {
     log.warn('Wallet has 0 sats — cannot fund ZkOS accounts. Fund the wallet first.')
     return
   }
 
-  let remaining = sats
+  let remaining = balance.sats
   for (const { strategy, amount } of needed) {
     const fundAmount = amount > 0 ? Math.min(amount, remaining) : remaining
     if (fundAmount <= 0) {
@@ -70,3 +132,4 @@ export async function ensureZkAccounts(
     }
   }
 }
+
