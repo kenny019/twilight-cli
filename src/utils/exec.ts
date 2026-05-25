@@ -11,7 +11,7 @@ export function execFileAsync(
   options?: { timeout?: number; cwd?: string },
 ): Promise<ExecResult> {
   return new Promise((resolve, reject) => {
-    nodeExecFile(command, args, { timeout: options?.timeout ?? 30000, ...options }, (error, stdout, stderr) => {
+    nodeExecFile(command, args, { timeout: options?.timeout ?? 90000, ...options }, (error, stdout, stderr) => {
       if (error) {
         reject(error)
       } else {

@@ -151,7 +151,7 @@ describe('WS-3: Twilight Client', () => {
       expect(result.requestId).toBe('GHI789')
       expect(mockExecFileAsync).toHaveBeenCalledWith(
         './bin/relayer-cli',
-        expect.arrayContaining(['zkaccount', 'transfer', '--from', '0']),
+        expect.arrayContaining(['zkaccount', 'transfer', '--account-index', '0']),
         expect.any(Object),
       )
     })
@@ -226,9 +226,10 @@ describe('WS-3: Twilight Client', () => {
     })
 
     it('queries trade status', async () => {
-      mockSuccess(JSON.stringify({ uuid: 'ORDER123', status: 'FILLED', side: 'LONG' }))
+      mockSuccess(JSON.stringify({ uuid: 'ORDER123', order_status: 'FILLED', side: 'LONG' }))
       const result = await client.queryTrade(0)
-      expect(result).toHaveProperty('uuid')
+      expect(result.orderStatus).toBe('FILLED')
+      expect(result.raw).toHaveProperty('uuid')
     })
 
     it('unlocks a settled SLTP trade', async () => {

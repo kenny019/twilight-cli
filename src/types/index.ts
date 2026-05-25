@@ -93,6 +93,13 @@ export interface TwilightTradeResult {
   status: string
 }
 
+export type TwilightOrderStatus = 'PENDING' | 'FILLED' | 'SETTLED' | 'CANCELLED' | 'LIQUIDATED' | 'UNKNOWN'
+
+export interface TwilightTradeQuery {
+  orderStatus: TwilightOrderStatus
+  raw: Record<string, unknown>
+}
+
 export interface TwilightLendPool {
   totalDeposits: number
   shareValue: number
@@ -112,7 +119,7 @@ export interface TwilightClient {
   openTrade(accountIndex: number, side: OrderSide, entryPrice: number, leverage: number, orderType?: OrderType): Promise<TwilightTradeResult>
   closeTrade(accountIndex: number, options?: { stopLoss?: number; takeProfit?: number }): Promise<TwilightTradeResult>
   cancelTrade(accountIndex: number): Promise<TwilightTradeResult>
-  queryTrade(accountIndex: number): Promise<Record<string, unknown>>
+  queryTrade(accountIndex: number): Promise<TwilightTradeQuery>
   unlockTrade(accountIndex: number): Promise<TwilightTradeResult>
   // Lending
   openLend(accountIndex: number): Promise<TwilightTradeResult>

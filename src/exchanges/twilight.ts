@@ -3,6 +3,8 @@ import type {
   TwilightClient,
   TwilightAccount,
   TwilightTradeResult,
+  TwilightTradeQuery,
+  TwilightOrderStatus,
   TwilightLendPool,
   TwilightMarketData,
   OrderSide,
@@ -122,14 +124,14 @@ export class TwilightClientImpl implements TwilightClient {
   // ─── Wallet operations ───────────────────────────────────────────
 
   async walletBalance(): Promise<{ nyks: number; sats: number }> {
-    const stdout = await this.invoke([...this.walletFlags(), 'wallet', 'balance'])
+    const stdout = await this.invoke(['wallet', 'balance', ...this.walletFlags()])
     const nyks = parseInt(stdout.match(/NYKS:\s+(\d+)/)?.[1] ?? '0', 10)
     const sats = parseInt(stdout.match(/SATS:\s+(\d+)/)?.[1] ?? '0', 10)
     return { nyks, sats }
   }
 
   async walletAccounts(): Promise<TwilightAccount[]> {
-    const stdout = await this.invoke([...this.walletFlags(), 'wallet', 'accounts'])
+    const stdout = await this.invoke(['wallet', 'accounts', ...this.walletFlags()])
     if (stdout.includes('No ZkOS accounts found')) return []
 
     const accounts: TwilightAccount[] = []
@@ -149,36 +151,48 @@ export class TwilightClientImpl implements TwilightClient {
     return accounts
   }
 
+  async syncNonce(): Promise<void> {
+    await this.invoke(['wallet', 'sync-nonce', ...this.walletFlags()])
+  }
+
   // ─── ZkAccount operations ────────────────────────────────────────
 
   async fund(amountSats: number): Promise<TwilightTradeResult> {
     const stdout = await this.invoke([
-      ...this.walletFlags(), 'zkaccount', 'fund', '--amount', String(amountSats),
+      'zkaccount', 'fund', ...this.walletFlags(), '--amount', String(amountSats),
     ])
     return this.parseTradeResult(stdout)
   }
 
   async withdraw(accountIndex: number): Promise<TwilightTradeResult> {
     const stdout = await this.invoke([
-      ...this.walletFlags(), 'zkaccount', 'withdraw', '--account-index', String(accountIndex),
+      'zkaccount', 'withdraw', ...this.walletFlags(), '--account-index', String(accountIndex),
     ])
     return this.parseTradeResult(stdout)
   }
 
   async transfer(fromAccountIndex: number): Promise<TwilightTradeResult> {
     const stdout = await this.invoke([
-      ...this.walletFlags(), 'zkaccount', 'transfer', '--from', String(fromAccountIndex),
+      'zkaccount', 'transfer', ...this.walletFlags(), '--account-index', String(fromAccountIndex),
     ])
+    // v0.1.2 prints "Transfer successful\n  New account index: N" — no TX hash header.
+    if (stdout.includes('Transfer successful')) {
+      const newIdx = parseInt(stdout.match(/New account index:\s*(\d+)/)?.[1] ?? '-1', 10)
+      return { requestId: `transfer-${fromAccountIndex}`, accountIndex: newIdx, status: 'success' }
+    }
     return this.parseTradeResult(stdout)
   }
 
   async split(fromAccountIndex: number, balancesSats: number[]): Promise<TwilightTradeResult> {
     const stdout = await this.invoke([
-      ...this.walletFlags(),
-      'zkaccount', 'split',
+      'zkaccount', 'split', ...this.walletFlags(),
       '--from', String(fromAccountIndex),
       '--balances', balancesSats.join(','),
     ])
+    // Split prints per-child summary, not the standard "TX hash" header.
+    if (stdout.includes('Split successful')) {
+      return { requestId: `split-${fromAccountIndex}`, accountIndex: fromAccountIndex, status: 'success' }
+    }
     return this.parseTradeResult(stdout)
   }
 
@@ -192,8 +206,7 @@ export class TwilightClientImpl implements TwilightClient {
     orderType: OrderType = 'MARKET',
   ): Promise<TwilightTradeResult> {
     const args = [
-      ...this.walletFlags(),
-      '--json', 'order', 'open-trade',
+      '--json', 'order', 'open-trade', ...this.walletFlags(),
       '--account-index', String(accountIndex),
       '--side', side,
       '--entry-price', String(entryPrice),
@@ -211,8 +224,7 @@ export class TwilightClientImpl implements TwilightClient {
     const hasSltp = options?.stopLoss !== undefined || options?.takeProfit !== undefined
 
     const args = [
-      ...this.walletFlags(),
-      '--json', 'order', 'close-trade',
+      '--json', 'order', 'close-trade', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]
 
@@ -239,22 +251,23 @@ export class TwilightClientImpl implements TwilightClient {
 
   async cancelTrade(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      ...this.walletFlags(), '--json', 'order', 'cancel-trade',
+      '--json', 'order', 'cancel-trade', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
   }
 
-  async queryTrade(accountIndex: number): Promise<Record<string, unknown>> {
-    return this.run([
-      ...this.walletFlags(), '--json', 'order', 'query-trade',
+  async queryTrade(accountIndex: number): Promise<TwilightTradeQuery> {
+    const raw = await this.run([
+      '--json', 'order', 'query-trade', ...this.walletFlags(),
       '--account-index', String(accountIndex),
-    ]) as Promise<Record<string, unknown>>
+    ]) as Record<string, unknown>
+    return { orderStatus: parseOrderStatus(raw), raw }
   }
 
   async unlockTrade(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      ...this.walletFlags(), '--json', 'order', 'unlock-trade',
+      '--json', 'order', 'unlock-trade', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
@@ -264,7 +277,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async openLend(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      ...this.walletFlags(), '--json', 'order', 'open-lend',
+      '--json', 'order', 'open-lend', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
@@ -272,7 +285,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async closeLend(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      ...this.walletFlags(), '--json', 'order', 'close-lend',
+      '--json', 'order', 'close-lend', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
@@ -280,8 +293,17 @@ export class TwilightClientImpl implements TwilightClient {
 
   async queryLend(accountIndex: number): Promise<Record<string, unknown>> {
     return this.run([
-      ...this.walletFlags(), '--json', 'order', 'query-lend',
+      '--json', 'order', 'query-lend', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]) as Promise<Record<string, unknown>>
   }
+}
+
+const VALID_ORDER_STATUSES: TwilightOrderStatus[] = ['PENDING', 'FILLED', 'SETTLED', 'CANCELLED', 'LIQUIDATED']
+
+function parseOrderStatus(raw: Record<string, unknown>): TwilightOrderStatus {
+  const candidate = (raw['order_status'] ?? raw['status']) as string | undefined
+  if (typeof candidate !== 'string') return 'UNKNOWN'
+  const upper = candidate.toUpperCase() as TwilightOrderStatus
+  return VALID_ORDER_STATUSES.includes(upper) ? upper : 'UNKNOWN'
 }

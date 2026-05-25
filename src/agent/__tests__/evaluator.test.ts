@@ -139,7 +139,7 @@ function makeTwilightClient(): TwilightClient {
     openTrade: vi.fn().mockResolvedValue({ requestId: 'r5', accountIndex: 0, status: 'ok' }),
     closeTrade: vi.fn().mockResolvedValue({ requestId: 'r6', accountIndex: 0, status: 'ok' }),
     cancelTrade: vi.fn().mockResolvedValue({ requestId: 'r7', accountIndex: 0, status: 'ok' }),
-    queryTrade: vi.fn().mockResolvedValue({}),
+    queryTrade: vi.fn().mockResolvedValue({ orderStatus: 'UNKNOWN', raw: {} }),
     unlockTrade: vi.fn().mockResolvedValue({ requestId: 'r8', accountIndex: 0, status: 'ok' }),
     openLend: vi.fn().mockResolvedValue({ requestId: 'r9', accountIndex: 0, status: 'ok' }),
     closeLend: vi.fn().mockResolvedValue({ requestId: 'r10', accountIndex: 0, status: 'ok' }),

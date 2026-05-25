@@ -2,6 +2,7 @@ import type {
   TwilightClient,
   TwilightAccount,
   TwilightTradeResult,
+  TwilightTradeQuery,
   TwilightLendPool,
   TwilightMarketData,
   OrderSide,
@@ -194,13 +195,17 @@ export class MockTwilightClient implements TwilightClient {
     return ok(accountIndex)
   }
 
-  async queryTrade(accountIndex: number): Promise<Record<string, unknown>> {
+  async queryTrade(accountIndex: number): Promise<TwilightTradeQuery> {
     const acct = this.requireAccount(accountIndex)
+    const orderStatus = acct.position ? 'FILLED' : 'UNKNOWN'
     return {
-      accountIndex,
-      ioType: acct.ioType,
-      balance: acct.balance,
-      position: acct.position ? { ...acct.position } : null,
+      orderStatus,
+      raw: {
+        accountIndex,
+        ioType: acct.ioType,
+        balance: acct.balance,
+        position: acct.position ? { ...acct.position } : null,
+      },
     }
   }
 
