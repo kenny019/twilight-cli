@@ -14,6 +14,7 @@ import { DiscordAlertClient } from './alerts/discord.js'
 import { FundingArbStrategy } from './strategies/templates/funding-arb.js'
 import { LendingYieldStrategy } from './strategies/templates/lending-yield.js'
 import { MarketMakerStrategy } from './strategies/templates/market-maker.js'
+import { VolumeFarmStrategy } from './strategies/templates/volume-farm.js'
 import { createLogger } from './utils/logger.js'
 import { applyAdjustedParams } from './types/agent.js'
 import type {
@@ -231,6 +232,7 @@ const TEMPLATE_STRATEGIES: Record<string, new () => Strategy> = {
   'funding-arb': FundingArbStrategy,
   'lending-yield': LendingYieldStrategy,
   'market-maker': MarketMakerStrategy,
+  'volume-farm': VolumeFarmStrategy,
 }
 
 const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
@@ -263,6 +265,16 @@ const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
     walletFloorSats: 60_000,
     bypassCooldown: true,
     minNyks: 1000,
+  },
+  'volume-farm': {
+    positionSizeSats: 5_000,
+    checkIntervalMs: 30_000,
+    dedicatedAccountIndices: [],
+    hyperliquidLeverage: 1,
+    hyperliquidMarginBufferUsdc: 5,
+    dailyVolumeCapSats: 50_000_000,
+    maxConsecutiveFailures: 3,
+    sideRotation: 'alternate',
   },
 }
 
