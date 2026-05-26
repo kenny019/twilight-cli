@@ -214,6 +214,11 @@ export class MockTwilightClient implements TwilightClient {
     return ok(accountIndex)
   }
 
+  async waitForOrderStatus(accountIndex: number, target: 'FILLED' | 'SETTLED'): Promise<'FILLED' | 'SETTLED' | 'PENDING' | 'CANCELLED' | 'LIQUIDATED' | 'UNKNOWN'> {
+    this.requireAccount(accountIndex)
+    return target
+  }
+
   // ─── Lending ──────────────────────────────────────────────
 
   async openLend(accountIndex: number): Promise<TwilightTradeResult> {

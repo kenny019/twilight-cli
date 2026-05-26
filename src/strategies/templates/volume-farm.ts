@@ -205,24 +205,47 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
 
     this.lastSide = twilightSide
 
-    // ── Atomic close: HL first, then Twilight ───────────────────────
+    // ── Wait for Twilight open to settle on-chain before issuing close.
+    //    open-trade returns "FILLED" once matched, but close-trade can
+    //    fail with "Failed to get tx hash, Order may be in the queue"
+    //    if the open's chain tx isn't indexed yet. ──
+    try {
+      await ctx.twilight.waitForOrderStatus(account.index, 'FILLED', { timeoutMs: 20_000 })
+    } catch (err) {
+      ctx.log.warn('volume-farm: open never reached FILLED — closing HL hedge, leaving Twilight to manual reconciliation', { err: (err as Error).message })
+      await this.safeCompensatingClose(ctx, hlSide, hlOpen.size)
+      this.recordFailure(ctx, 'tw-open-wait', err as Error)
+      return
+    }
+
+    // ── Atomic close: HL first (flat the hedge), Twilight second ────
     const hlClose = await hl.closePosition(hlSide, hlOpen.size).catch((e: Error) => ({ error: e }))
     if ('error' in hlClose) {
       ctx.log.error('volume-farm: HL close failed — Twilight still open, will attempt close anyway', { err: hlClose.error.message })
-      // Continue to close Twilight regardless; HL position will need manual cleanup
+      // Continue; HL position will need manual cleanup
     }
 
-    const twClose = await ctx.twilight.closeTrade(account.index).catch((e: Error) => ({ error: e }))
+    // skipRotation: we'll do unlock + transfer ourselves AFTER SETTLED.
+    const twClose = await ctx.twilight.closeTrade(account.index, { skipRotation: true }).catch((e: Error) => ({ error: e }))
     if ('error' in twClose) {
-      ctx.log.error('volume-farm: Twilight close failed — naked HL leg may exist', { err: twClose.error.message })
+      ctx.log.error('volume-farm: Twilight close failed — naked Twilight leg', { err: twClose.error.message })
       this.recordFailure(ctx, 'tw-close', twClose.error)
       return
     }
 
-    // ── Unlock the settled account, then transfer to rotate to a fresh
-    //    account. Without the transfer, the next open-trade against the
-    //    same index fails with "Value Witness Verification Failed" because
-    //    the account still carries the previous order's witness. ──
+    // ── Wait for the close to settle before unlock + transfer. ──
+    try {
+      await ctx.twilight.waitForOrderStatus(account.index, 'SETTLED', { timeoutMs: 30_000 })
+    } catch (err) {
+      ctx.log.warn('volume-farm: close never reached SETTLED — skipping unlock+transfer; account left in Memo state', { accountIndex: account.index, err: (err as Error).message })
+      this.recordFailure(ctx, 'tw-close-wait', err as Error)
+      return
+    }
+
+    // ── Unlock the settled account (Memo → Coin), then transfer to
+    //    rotate to a fresh index. Without the transfer, the next
+    //    open-trade against the same index fails with "Value Witness
+    //    Verification Failed". ──
     try {
       await ctx.twilight.unlockTrade(account.index)
     } catch (err) {
@@ -233,7 +256,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     try {
       await ctx.twilight.transfer(account.index)
     } catch (err) {
-      ctx.log.warn('volume-farm: transfer (rotate) failed — account stuck in Coin/ORDERTX state, next tick will skip it', { accountIndex: account.index, error: (err as Error).message })
+      ctx.log.warn('volume-farm: transfer (rotate) failed — account stuck in Coin/ORDERTX, next tick will skip it', { accountIndex: account.index, error: (err as Error).message })
       this.recordFailure(ctx, 'transfer', err as Error)
       return
     }

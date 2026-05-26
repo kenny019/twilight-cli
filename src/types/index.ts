@@ -122,7 +122,8 @@ export interface TwilightClient {
   split(fromAccountIndex: number, balancesSats: number[]): Promise<TwilightTradeResult>
   // Orders
   openTrade(accountIndex: number, side: OrderSide, entryPrice: number, leverage: number, orderType?: OrderType): Promise<TwilightTradeResult>
-  closeTrade(accountIndex: number, options?: { stopLoss?: number; takeProfit?: number }): Promise<TwilightTradeResult>
+  closeTrade(accountIndex: number, options?: { stopLoss?: number; takeProfit?: number; skipRotation?: boolean }): Promise<TwilightTradeResult>
+  waitForOrderStatus(accountIndex: number, target: 'FILLED' | 'SETTLED', options?: { timeoutMs?: number; pollIntervalMs?: number }): Promise<TwilightOrderStatus>
   cancelTrade(accountIndex: number): Promise<TwilightTradeResult>
   queryTrade(accountIndex: number): Promise<TwilightTradeQuery>
   unlockTrade(accountIndex: number): Promise<TwilightTradeResult>

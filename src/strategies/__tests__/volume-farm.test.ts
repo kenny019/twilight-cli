@@ -11,6 +11,7 @@ function makeCtx(): Context {
       closeTrade: vi.fn().mockResolvedValue({ requestId: 'TW2', accountIndex: 7, status: 'SETTLED' }),
       unlockTrade: vi.fn().mockResolvedValue({ requestId: 'TW3', accountIndex: 7, status: 'success' }),
       transfer: vi.fn().mockResolvedValue({ requestId: 'TW4', accountIndex: 8, status: 'success' }),
+      waitForOrderStatus: vi.fn().mockResolvedValue('SETTLED'),
       marketPrice: vi.fn().mockResolvedValue(76700),
       fund: vi.fn(), withdraw: vi.fn(), split: vi.fn(),
       cancelTrade: vi.fn(), queryTrade: vi.fn().mockResolvedValue({ orderStatus: 'FILLED', raw: {} }),

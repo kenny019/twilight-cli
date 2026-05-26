@@ -219,7 +219,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async closeTrade(
     accountIndex: number,
-    options?: { stopLoss?: number; takeProfit?: number },
+    options?: { stopLoss?: number; takeProfit?: number; skipRotation?: boolean },
   ): Promise<TwilightTradeResult> {
     const hasSltp = options?.stopLoss !== undefined || options?.takeProfit !== undefined
 
@@ -240,13 +240,46 @@ export class TwilightClientImpl implements TwilightClient {
     const raw = await this.run(args) as Record<string, unknown>
     const result = this.mapTradeResult(raw)
 
-    // Auto-rotate the account after a plain close; SLTP closes leave the
-    // account locked until settlement so rotation must wait.
-    if (!hasSltp) {
+    // Auto-rotate after a plain close. Skipped for SLTP (account stays
+    // locked until settlement) and for callers that manage rotation
+    // themselves (e.g. volume-farm, which waits for SETTLED + unlock
+    // before transferring).
+    if (!hasSltp && !options?.skipRotation) {
       await this.transfer(accountIndex)
     }
 
     return result
+  }
+
+  // Polls queryTrade until orderStatus matches target (or a terminal failure
+  // status appears). Used by strategies that need explicit chain settlement
+  // confirmation between open → close → unlock → transfer steps.
+  async waitForOrderStatus(
+    accountIndex: number,
+    target: 'FILLED' | 'SETTLED',
+    options?: { timeoutMs?: number; pollIntervalMs?: number },
+  ): Promise<TwilightOrderStatus> {
+    const timeoutMs = options?.timeoutMs ?? 30_000
+    const interval = options?.pollIntervalMs ?? 1_000
+    const deadline = Date.now() + timeoutMs
+    let last: TwilightOrderStatus = 'UNKNOWN'
+
+    while (Date.now() < deadline) {
+      try {
+        const q = await this.queryTrade(accountIndex)
+        last = q.orderStatus
+        if (last === target) return last
+        if (last === 'CANCELLED' || last === 'LIQUIDATED') {
+          throw new Error(`waitForOrderStatus: terminal status ${last} (wanted ${target})`)
+        }
+      } catch (err) {
+        // queryTrade can transiently fail while chain catches up; keep polling
+        // until the deadline. Re-throw on the last try via the post-loop throw.
+        if ((err as Error).message.startsWith('waitForOrderStatus:')) throw err
+      }
+      await new Promise(r => setTimeout(r, interval))
+    }
+    throw new Error(`waitForOrderStatus: timeout after ${timeoutMs}ms (last=${last}, wanted=${target})`)
   }
 
   async cancelTrade(accountIndex: number): Promise<TwilightTradeResult> {
