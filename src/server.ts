@@ -239,7 +239,7 @@ const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
     exitThreshold: 0.002,
     positionSizeSats: 13_000,
     checkIntervalMs: 300_000,
-    dedicatedAccountIndices: [2, 3],
+    dedicatedAccountIndices: [],
     maxConsecutiveFailures: 3,
     minHoldUntilNextFundingMs: 600_000,
     maxHoldMs: 86_400_000,
