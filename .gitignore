@@ -12,3 +12,7 @@ bin/
 # Cloned relayer source (used during setup to build binary)
 .relayer-src/
 
+# Claude Code per-machine state (lock files, locally-installed skills)
+.claude/scheduled_tasks.lock
+.claude/skills/
+

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>gg.kyubi.twilight-mm</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/node</string>
+        <string>--env-file=.env</string>
+        <string>dist/server.js</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/macmini/twilight-agent</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_PATH</key>
+        <string>/Users/macmini/twilight-agent/data/twilight-bots.db</string>
+        <key>RELAYER_PROGRAM_JSON_PATH</key>
+        <string>/Users/macmini/twilight-agent/bin/relayerprogram.json</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/macmini/twilight-agent/data/server.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/macmini/twilight-agent/data/server.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
