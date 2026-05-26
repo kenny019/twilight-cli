@@ -300,7 +300,7 @@ export class TwilightClientImpl implements TwilightClient {
 
   async unlockTrade(accountIndex: number): Promise<TwilightTradeResult> {
     const raw = await this.run([
-      '--json', 'order', 'unlock-trade', ...this.walletFlags(),
+      '--json', 'order', 'unlock-close-order', ...this.walletFlags(),
       '--account-index', String(accountIndex),
     ]) as Record<string, unknown>
     return this.mapTradeResult(raw)
