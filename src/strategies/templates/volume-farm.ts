@@ -158,11 +158,19 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     const hedged = cfg.hedge === 'hyperliquid'
     if (hedged && !ctx.hyperliquid) return
 
-    // Pick an idle Twilight account
-    const accounts = await ctx.twilight.walletAccounts()
-    const account = this.pickAccount(accounts)
+    // Pick an idle Twilight account. If none is fresh (Coin/-), try
+    // recovering a stale Coin/ORDERTX (interrupted-round residue) once.
+    let accounts = await ctx.twilight.walletAccounts()
+    let account = this.pickAccount(accounts)
     if (!account) {
-      ctx.log.warn('volume-farm: no eligible idle Coin account', {
+      const recovered = await this.tryRecoverStaleAccount(ctx, accounts)
+      if (recovered) {
+        accounts = await ctx.twilight.walletAccounts()
+        account = this.pickAccount(accounts)
+      }
+    }
+    if (!account) {
+      ctx.log.warn('volume-farm: no eligible fresh Coin account', {
         dedicated: cfg.dedicatedAccountIndices,
         requiredSize: cfg.positionSizeSats,
       })
@@ -289,12 +297,44 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     const indexFilter = cfg.dedicatedAccountIndices.length === 0
       ? () => true
       : (idx: number) => cfg.dedicatedAccountIndices.includes(idx)
+    // A fresh account (txType='-') is required. Coin/ORDERTX accounts carry
+    // a previous-order witness and will be rejected by the chain with
+    // "Value Witness Verification Failed". When a previous round was
+    // interrupted (e.g. by a restart) and left such an account, the
+    // recovery path in execute() rotates it before picking.
     return accounts.find(a =>
       indexFilter(a.index)
       && a.onChain
       && a.ioType === 'Coin'
+      && (a.txType === '-' || a.txType === undefined)
       && a.balance >= cfg.positionSizeSats,
     )
+  }
+
+  // Recover a Coin/ORDERTX account by rotating it to fresh Coin/-. Used at
+  // tick start when a prior round was interrupted before the post-close
+  // transfer completed.
+  private async tryRecoverStaleAccount(ctx: Context, accounts: TwilightAccount[]): Promise<boolean> {
+    const cfg = this.config
+    const indexFilter = cfg.dedicatedAccountIndices.length === 0
+      ? () => true
+      : (idx: number) => cfg.dedicatedAccountIndices.includes(idx)
+    const stale = accounts.find(a =>
+      indexFilter(a.index)
+      && a.onChain
+      && a.ioType === 'Coin'
+      && a.txType === 'ORDERTX'
+      && a.balance >= cfg.positionSizeSats,
+    )
+    if (!stale) return false
+    try {
+      await ctx.twilight.transfer(stale.index)
+      ctx.log.info('volume-farm: recovered stale Coin/ORDERTX account by rotating', { accountIndex: stale.index })
+      return true
+    } catch (err) {
+      ctx.log.warn('volume-farm: stale account rotation failed', { accountIndex: stale.index, error: (err as Error).message })
+      return false
+    }
   }
 
   private async safeCompensatingClose(ctx: Context, hlSide: OrderSide, sizeBtc: number): Promise<void> {

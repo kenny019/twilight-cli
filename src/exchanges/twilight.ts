@@ -137,14 +137,26 @@ export class TwilightClientImpl implements TwilightClient {
     const accounts: TwilightAccount[] = []
     const lines = stdout.split('\n')
     for (const line of lines) {
-      // Match table rows: INDEX  BALANCE  ON-CHAIN  IO-TYPE  ACCOUNT
-      const match = line.match(/^\s*(\d+)\s+(\d+)\s+(true|false)\s+(\S+)\s+(\S+)/)
-      if (match) {
+      // Tolerate both v0.1.1 (5 cols: INDEX BALANCE ON-CHAIN IO-TYPE ACCOUNT)
+      // and v0.1.2 (6 cols: ... IO-TYPE TX-TYPE ACCOUNT). The 6-col form
+      // is distinguished by the presence of a 5th non-account field;
+      // v0.1.1 has the account hash there.
+      const match6 = line.match(/^\s*(\d+)\s+(\d+)\s+(true|false)\s+(\S+)\s+(\S+)\s+(\S+)\s*$/)
+      const match5 = line.match(/^\s*(\d+)\s+(\d+)\s+(true|false)\s+(\S+)\s+(\S+)\s*$/)
+      if (match6) {
         accounts.push({
-          index: parseInt(match[1], 10),
-          balance: parseInt(match[2], 10),
-          onChain: match[3] === 'true',
-          ioType: match[4],
+          index: parseInt(match6[1], 10),
+          balance: parseInt(match6[2], 10),
+          onChain: match6[3] === 'true',
+          ioType: match6[4],
+          txType: match6[5],
+        })
+      } else if (match5) {
+        accounts.push({
+          index: parseInt(match5[1], 10),
+          balance: parseInt(match5[2], 10),
+          onChain: match5[3] === 'true',
+          ioType: match5[4],
         })
       }
     }

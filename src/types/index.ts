@@ -90,6 +90,7 @@ export interface TwilightAccount {
   balance: number
   onChain: boolean
   ioType: string
+  txType?: string   // '-' = fresh (never traded or freshly transferred); 'ORDERTX' = has previous-order witness
 }
 
 export interface TwilightTradeResult {
