@@ -10,8 +10,9 @@ function makeCtx(): Context {
       openTrade: vi.fn().mockResolvedValue({ requestId: 'TW1', accountIndex: 7, status: 'FILLED' }),
       closeTrade: vi.fn().mockResolvedValue({ requestId: 'TW2', accountIndex: 7, status: 'SETTLED' }),
       unlockTrade: vi.fn().mockResolvedValue({ requestId: 'TW3', accountIndex: 7, status: 'success' }),
+      transfer: vi.fn().mockResolvedValue({ requestId: 'TW4', accountIndex: 8, status: 'success' }),
       marketPrice: vi.fn().mockResolvedValue(76700),
-      fund: vi.fn(), withdraw: vi.fn(), transfer: vi.fn(), split: vi.fn(),
+      fund: vi.fn(), withdraw: vi.fn(), split: vi.fn(),
       cancelTrade: vi.fn(), queryTrade: vi.fn().mockResolvedValue({ orderStatus: 'FILLED', raw: {} }),
       openLend: vi.fn(), closeLend: vi.fn(), queryLend: vi.fn(),
       fundingRate: vi.fn().mockResolvedValue(-0.002348),
@@ -68,7 +69,7 @@ describe('VolumeFarmStrategy', () => {
     }, ctx)
   })
 
-  it('happy path: HL open → Twilight open → HL close → Twilight close → unlock; daily volume increments', async () => {
+  it('happy path: HL open → Twilight open → HL close → Twilight close → unlock → transfer; daily volume increments', async () => {
     await strategy.tick()
 
     expect(ctx.hyperliquid!.openPosition).toHaveBeenCalledTimes(1)
@@ -76,11 +77,25 @@ describe('VolumeFarmStrategy', () => {
     expect(ctx.hyperliquid!.closePosition).toHaveBeenCalledTimes(1)
     expect(ctx.twilight.closeTrade).toHaveBeenCalledTimes(1)
     expect(ctx.twilight.unlockTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.transfer).toHaveBeenCalledWith(7)
 
     // 2× positionSizeSats (open + close legs)
     const status = strategy.status()
     expect((status.config as any).dailyVolumeSats).toBe(10_000)
     expect((status.config as any).totalVolume).toBe(10_000)
+  })
+
+  it('transfer failure after close: counts as failure (account state needs manual cleanup)', async () => {
+    ;(ctx.twilight.transfer as any).mockRejectedValue(new Error('transfer-rejected'))
+    await strategy.tick()
+    // open/close path ran fully
+    expect(ctx.twilight.openTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.closeTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.unlockTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)
+    // but counts as a failure
+    expect(strategy.status().errorCount + (strategy as any).consecutiveFailures).toBeGreaterThan(0)
   })
 
   it('daily volume cap halts further opens', async () => {

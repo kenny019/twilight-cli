@@ -219,11 +219,23 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       return
     }
 
-    // ── Unlock the now-settled Twilight account back to Coin state ──
+    // ── Unlock the settled account, then transfer to rotate to a fresh
+    //    account. Without the transfer, the next open-trade against the
+    //    same index fails with "Value Witness Verification Failed" because
+    //    the account still carries the previous order's witness. ──
     try {
       await ctx.twilight.unlockTrade(account.index)
     } catch (err) {
-      ctx.log.warn('volume-farm: unlock-close-order failed — account may need manual unlock', { error: (err as Error).message })
+      ctx.log.warn('volume-farm: unlock-close-order failed — manual cleanup needed', { accountIndex: account.index, error: (err as Error).message })
+      this.recordFailure(ctx, 'unlock', err as Error)
+      return
+    }
+    try {
+      await ctx.twilight.transfer(account.index)
+    } catch (err) {
+      ctx.log.warn('volume-farm: transfer (rotate) failed — account stuck in Coin/ORDERTX state, next tick will skip it', { accountIndex: account.index, error: (err as Error).message })
+      this.recordFailure(ctx, 'transfer', err as Error)
+      return
     }
 
     // ── Accounting ──────────────────────────────────────────────────
