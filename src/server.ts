@@ -267,12 +267,15 @@ const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
     minNyks: 1000,
   },
   'volume-farm': {
-    positionSizeSats: 5_000,
-    checkIntervalMs: 30_000,
+    // Pilot config: small size + tight daily cap. ~$23 Twilight notional/day,
+    // ~$6/day HL fees, ~10-day runway on $58 USDC. Widen after verifying
+    // that volume actually credits on Twilight's points dashboard.
+    positionSizeSats: 3_000,
+    checkIntervalMs: 60_000,
     dedicatedAccountIndices: [],
     hyperliquidLeverage: 1,
     hyperliquidMarginBufferUsdc: 5,
-    dailyVolumeCapSats: 50_000_000,
+    dailyVolumeCapSats: 3_000_000,
     maxConsecutiveFailures: 3,
     sideRotation: 'alternate',
   },
