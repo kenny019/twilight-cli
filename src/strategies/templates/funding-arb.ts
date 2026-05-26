@@ -276,10 +276,13 @@ export class FundingArbStrategy implements Strategy, ProposableStrategy {
       return
     }
 
-    // Idle Twilight account from dedicated set
+    // Idle Twilight account from dedicated set (empty list = no index filter)
     const accounts = await ctx.twilight.walletAccounts()
+    const indexFilter = cfg.dedicatedAccountIndices.length === 0
+      ? () => true
+      : (idx: number) => cfg.dedicatedAccountIndices.includes(idx)
     const idleAccount = accounts.find(a =>
-      cfg.dedicatedAccountIndices.includes(a.index)
+      indexFilter(a.index)
       && a.onChain
       && a.ioType === 'Coin'
       && a.balance >= cfg.positionSizeSats,

@@ -236,6 +236,25 @@ describe('WS-9: Template Strategies', () => {
       expect(ctx.twilight.openTrade).not.toHaveBeenCalled()
     })
 
+    it('treats empty dedicatedAccountIndices as no-index-filter (uses any eligible Coin account)', async () => {
+      freezeMidHour()
+      await strategy.init({
+        entryThreshold: 0.01, exitThreshold: 0.002,
+        positionSizeSats: 13_000, checkIntervalMs: 60_000,
+        dedicatedAccountIndices: [], maxConsecutiveFailures: 3,
+        minHoldUntilNextFundingMs: 600_000, maxHoldMs: 86_400_000,
+        hyperliquidLeverage: 1, hyperliquidMarginBufferUsdc: 5,
+      }, ctx)
+      ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+        { index: 7, balance: 13_000, onChain: true, ioType: 'Coin' },   // index NOT in [2,3] but list is empty
+      ])
+      ;(ctx.twilight.fundingRate as any).mockResolvedValue(0.068)
+      ;(ctx.hyperliquid!.getFundingRate as any).mockResolvedValue(0.0)
+
+      await strategy.tick()
+      expect(ctx.twilight.openTrade).toHaveBeenCalled()
+    })
+
     it('rejects accounts that are off-chain or non-Coin even within dedicated set', async () => {
       freezeMidHour()
       ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
