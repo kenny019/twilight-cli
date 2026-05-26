@@ -82,7 +82,11 @@ export class HyperliquidClientImpl implements HyperliquidClient {
 
   // ─── Trading ────────────────────────────────────────────────────
 
-  async openPosition(side: OrderSide, sizeBtc: number, _leverage: number): Promise<HyperliquidOrderResult> {
+  async openPosition(side: OrderSide, sizeBtc: number, leverage: number): Promise<HyperliquidOrderResult> {
+    // HL leverage is account-wide per asset, not per-order. Re-affirm each entry
+    // so manual UI changes can't silently shift the strategy's risk profile.
+    const assetIdx = await this.#resolveAssetIndex(this.#coin)
+    await this.#exchange.updateLeverage({ asset: assetIdx, isCross: true, leverage })
     return this.#marketOrder(side, sizeBtc, false)
   }
 
