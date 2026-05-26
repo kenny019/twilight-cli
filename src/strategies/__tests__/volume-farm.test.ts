@@ -207,6 +207,46 @@ describe('VolumeFarmStrategy', () => {
     expect(noHlCtx.twilight.openTrade).not.toHaveBeenCalled()
   })
 
+  it("hedge='none' mode: skips HL entirely, completes round on Twilight alone", async () => {
+    await strategy.init({
+      positionSizeSats: 3_000, checkIntervalMs: 60_000, dedicatedAccountIndices: [],
+      hedge: 'none',
+      hyperliquidLeverage: 1, hyperliquidMarginBufferUsdc: 5,
+      dailyVolumeCapSats: 50_000_000, maxConsecutiveFailures: 3,
+      sideRotation: 'alternate',
+    }, ctx)
+
+    await strategy.tick()
+
+    // HL NEVER called
+    expect(ctx.hyperliquid!.openPosition).not.toHaveBeenCalled()
+    expect(ctx.hyperliquid!.closePosition).not.toHaveBeenCalled()
+    expect(ctx.hyperliquid!.getBalance).not.toHaveBeenCalled()
+    expect(ctx.hyperliquid!.getMarkPrice).not.toHaveBeenCalled()
+
+    // Twilight full cycle
+    expect(ctx.twilight.openTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.closeTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.unlockTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)
+  })
+
+  it("hedge='none' + no HL configured: still works", async () => {
+    const noHlCtx = makeCtx()
+    delete (noHlCtx as any).hyperliquid
+    await strategy.init({
+      positionSizeSats: 3_000, checkIntervalMs: 60_000, dedicatedAccountIndices: [],
+      hedge: 'none',
+      hyperliquidLeverage: 1, hyperliquidMarginBufferUsdc: 5,
+      dailyVolumeCapSats: 50_000_000, maxConsecutiveFailures: 3,
+      sideRotation: 'alternate',
+    }, noHlCtx)
+
+    await strategy.tick()
+    expect(noHlCtx.twilight.openTrade).toHaveBeenCalledTimes(1)
+    expect(noHlCtx.twilight.closeTrade).toHaveBeenCalledTimes(1)
+  })
+
   it('dedicatedAccountIndices filter respected when non-empty', async () => {
     await strategy.init({
       positionSizeSats: 5_000, checkIntervalMs: 30_000,

@@ -267,12 +267,15 @@ const DEFAULT_CONFIGS: Record<string, StrategyConfig> = {
     minNyks: 1000,
   },
   'volume-farm': {
-    // Pilot config: small size + tight daily cap. ~$23 Twilight notional/day,
-    // ~$6/day HL fees, ~10-day runway on $58 USDC. Widen after verifying
-    // that volume actually credits on Twilight's points dashboard.
+    // Pilot config. With hedge='none' the per-round cost is ~$0.0003 (TW
+    // fees + tiny slippage), so we can leave the daily cap generous.
+    // Tiny per-round price variance (~$0.002 stdev for the ~10s TW open
+    // window at $2.30 notional) is the trade we accept for ~95% lower
+    // cost than the hedged path.
     positionSizeSats: 3_000,
     checkIntervalMs: 60_000,
     dedicatedAccountIndices: [],
+    hedge: 'none',
     hyperliquidLeverage: 1,
     hyperliquidMarginBufferUsdc: 5,
     dailyVolumeCapSats: 3_000_000,

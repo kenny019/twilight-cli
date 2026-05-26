@@ -13,8 +13,9 @@ interface VolumeFarmConfig {
   positionSizeSats: number               // size per round-trip on Twilight
   checkIntervalMs: number                // tick interval (each tick = one round-trip attempt)
   dedicatedAccountIndices: number[]      // empty = any idle Coin account
+  hedge: 'hyperliquid' | 'none'          // 'none' = TW-only, accepts tiny per-round price variance
   hyperliquidLeverage: number
-  hyperliquidMarginBufferUsdc: number    // require balance >= roundMargin + buffer
+  hyperliquidMarginBufferUsdc: number    // require balance >= roundMargin + buffer (when hedged)
   dailyVolumeCapSats: number             // cumulative Twilight notional/day (both sides counted)
   maxConsecutiveFailures: number         // trip per-strategy killswitch after N
   sideRotation: 'alternate' | 'random' | 'long-only' | 'short-only'
@@ -28,13 +29,14 @@ interface DailyVolume {
 export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   id = 'volume-farm'
   name = 'Volume Farm'
-  description = 'Generates hedged round-trip volume on Twilight to qualify for trading-volume points programs, with HL hedge neutralizing price risk.'
+  description = 'Generates round-trip volume on Twilight to qualify for trading-volume points programs. Hedge mode is configurable: hyperliquid (neutralizes price risk, higher fees) or none (TW-only, ~95% cheaper, tiny per-round price variance).'
   configSchema: Record<string, unknown> = {
     type: 'object',
     properties: {
       positionSizeSats:             { type: 'number' },
       checkIntervalMs:              { type: 'number' },
       dedicatedAccountIndices:      { type: 'array', items: { type: 'number' } },
+      hedge:                        { type: 'string', enum: ['hyperliquid', 'none'] },
       hyperliquidLeverage:          { type: 'number' },
       hyperliquidMarginBufferUsdc:  { type: 'number' },
       dailyVolumeCapSats:           { type: 'number' },
@@ -63,6 +65,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       positionSizeSats:            5_000,
       checkIntervalMs:             30_000,
       dedicatedAccountIndices:     [],
+      hedge:                       'hyperliquid',
       hyperliquidLeverage:         1,
       hyperliquidMarginBufferUsdc: 5,
       dailyVolumeCapSats:          50_000_000,        // ~$385 notional/day default
@@ -109,7 +112,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   async propose(ctx: Context): Promise<TradeProposal | null> {
     if (this.disabled) return null
     if (await ctx.risk.isKillSwitchActive()) return null
-    if (!ctx.hyperliquid) {
+    if (this.config.hedge === 'hyperliquid' && !ctx.hyperliquid) {
       ctx.log.debug('volume-farm: hyperliquid client not configured — inert')
       return null
     }
@@ -150,9 +153,10 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   }
 
   async execute(ctx: Context, _evaluation: AgentEvaluation): Promise<void> {
-    if (this.disabled || !ctx.hyperliquid) return
-    const hl = ctx.hyperliquid
+    if (this.disabled) return
     const cfg = this.config
+    const hedged = cfg.hedge === 'hyperliquid'
+    if (hedged && !ctx.hyperliquid) return
 
     // Pick an idle Twilight account
     const accounts = await ctx.twilight.walletAccounts()
@@ -165,40 +169,41 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       return
     }
 
-    // Sample prices for sizing
-    const [twilightMark, hlMark] = await Promise.all([
-      ctx.twilight.marketPrice(),
-      hl.getMarkPrice(),
-    ])
-
-    // HL margin check
-    const sizeBtc = hl.quantizeBtcSize(cfg.positionSizeSats, hlMark)
-    const requiredMargin = (sizeBtc * hlMark) / cfg.hyperliquidLeverage
-    const hlBalance = await hl.getBalance()
-    if (hlBalance < requiredMargin + cfg.hyperliquidMarginBufferUsdc) {
-      ctx.log.warn('volume-farm: insufficient HL balance', { hlBalance, requiredMargin, buffer: cfg.hyperliquidMarginBufferUsdc })
-      return
-    }
-
+    const twilightMark = await ctx.twilight.marketPrice()
     const twilightSide = this.pickSide()
-    const hlSide: OrderSide = twilightSide === 'LONG' ? 'SHORT' : 'LONG'
 
-    // ── Atomic open: HL first, then Twilight ────────────────────────
-    const hlOpen = await hl.openPosition(hlSide, sizeBtc, cfg.hyperliquidLeverage).catch((e: Error) => ({ error: e }))
-    if ('error' in hlOpen) {
-      this.recordFailure(ctx, 'hl-open', hlOpen.error)
-      return
-    }
-    if (hlOpen.status !== 'filled') {
-      ctx.log.warn('volume-farm: HL open not filled', { hlOpen })
-      this.recordFailure(ctx, 'hl-open-status', new Error(`status=${hlOpen.status}`))
-      return
+    // ── Optional HL hedge open ─────────────────────────────────────
+    let hlOpenSize = 0
+    let hlSide: OrderSide = 'SHORT'
+    if (hedged) {
+      const hl = ctx.hyperliquid!
+      const hlMark = await hl.getMarkPrice()
+      const sizeBtc = hl.quantizeBtcSize(cfg.positionSizeSats, hlMark)
+      const requiredMargin = (sizeBtc * hlMark) / cfg.hyperliquidLeverage
+      const hlBalance = await hl.getBalance()
+      if (hlBalance < requiredMargin + cfg.hyperliquidMarginBufferUsdc) {
+        ctx.log.warn('volume-farm: insufficient HL balance', { hlBalance, requiredMargin, buffer: cfg.hyperliquidMarginBufferUsdc })
+        return
+      }
+      hlSide = twilightSide === 'LONG' ? 'SHORT' : 'LONG'
+      const hlOpen = await hl.openPosition(hlSide, sizeBtc, cfg.hyperliquidLeverage).catch((e: Error) => ({ error: e }))
+      if ('error' in hlOpen) {
+        this.recordFailure(ctx, 'hl-open', hlOpen.error)
+        return
+      }
+      if (hlOpen.status !== 'filled') {
+        ctx.log.warn('volume-farm: HL open not filled', { hlOpen })
+        this.recordFailure(ctx, 'hl-open-status', new Error(`status=${hlOpen.status}`))
+        return
+      }
+      hlOpenSize = hlOpen.size
     }
 
+    // ── Twilight open ──────────────────────────────────────────────
     const twOpen = await ctx.twilight.openTrade(account.index, twilightSide, twilightMark, 1).catch((e: Error) => ({ error: e }))
     if ('error' in twOpen) {
-      ctx.log.error('volume-farm: Twilight open failed — closing HL hedge', { err: twOpen.error.message })
-      await this.safeCompensatingClose(ctx, hlSide, hlOpen.size)
+      ctx.log.error('volume-farm: Twilight open failed', { err: twOpen.error.message, hedged })
+      if (hedged) await this.safeCompensatingClose(ctx, hlSide, hlOpenSize)
       this.recordFailure(ctx, 'tw-open', twOpen.error)
       return
     }
@@ -212,17 +217,20 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     try {
       await ctx.twilight.waitForOrderStatus(account.index, 'FILLED', { timeoutMs: 20_000 })
     } catch (err) {
-      ctx.log.warn('volume-farm: open never reached FILLED — closing HL hedge, leaving Twilight to manual reconciliation', { err: (err as Error).message })
-      await this.safeCompensatingClose(ctx, hlSide, hlOpen.size)
+      ctx.log.warn('volume-farm: open never reached FILLED — leaving Twilight to manual reconciliation', { err: (err as Error).message })
+      if (hedged) await this.safeCompensatingClose(ctx, hlSide, hlOpenSize)
       this.recordFailure(ctx, 'tw-open-wait', err as Error)
       return
     }
 
-    // ── Atomic close: HL first (flat the hedge), Twilight second ────
-    const hlClose = await hl.closePosition(hlSide, hlOpen.size).catch((e: Error) => ({ error: e }))
-    if ('error' in hlClose) {
-      ctx.log.error('volume-farm: HL close failed — Twilight still open, will attempt close anyway', { err: hlClose.error.message })
-      // Continue; HL position will need manual cleanup
+    // ── Optional HL hedge close (first, so hedge is flat before TW closes) ─
+    if (hedged) {
+      const hl = ctx.hyperliquid!
+      const hlClose = await hl.closePosition(hlSide, hlOpenSize).catch((e: Error) => ({ error: e }))
+      if ('error' in hlClose) {
+        ctx.log.error('volume-farm: HL close failed — Twilight still open, will attempt close anyway', { err: hlClose.error.message })
+        // Continue; HL position will need manual cleanup
+      }
     }
 
     // skipRotation: we'll do unlock + transfer ourselves AFTER SETTLED.
