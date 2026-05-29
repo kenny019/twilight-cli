@@ -34,6 +34,59 @@ export async function ensureZkAccounts(
       } else {
         needed.push({ strategy: id, amount: 0 })
       }
+    } else if (id === 'volume-farm') {
+      const positionSize = (cfg.positionSizeSats as number) ?? 3_000
+      const childSize = Math.max(positionSize * 2, 5_000)
+      const minFresh = 5
+      const fresh = (a: { onChain: boolean; ioType: string; txType?: string; balance: number }) =>
+        a.onChain && a.ioType === 'Coin' && (a.txType === '-' || a.txType === undefined) && a.balance >= positionSize
+      const freshCount = (await ctx.twilight.walletAccounts()).filter(fresh).length
+      if (freshCount >= minFresh) {
+        log.info('volume-farm: sufficient fresh Coin accounts available', { freshCount, minFresh })
+        continue
+      }
+
+      const syncNonceA = (ctx.twilight as { syncNonce?: () => Promise<void> }).syncNonce
+      if (typeof syncNonceA === 'function') {
+        try { await syncNonceA.call(ctx.twilight) } catch (err) { log.warn('sync-nonce failed — continuing', { error: (err as Error).message }) }
+      }
+
+      const deficit = minFresh - freshCount
+      const fundAmount = deficit * childSize
+      const { sats } = await ctx.twilight.walletBalance()
+      if (sats < fundAmount) {
+        log.warn('volume-farm: wallet sats below required prefund amount', { sats, fundAmount })
+        continue
+      }
+
+      try {
+        log.info('volume-farm: funding parent ZkOS account', { fundAmount, deficit, childSize })
+        const fundResult = await ctx.twilight.fund(fundAmount)
+        const parentIndex = fundResult.accountIndex
+        log.info('volume-farm: splitting parent into child accounts', { parentIndex, deficit, childSize })
+        for (let i = 0; i < deficit; i++) {
+          try {
+            await ctx.twilight.split(parentIndex, [childSize])
+          } catch (err) {
+            log.warn('volume-farm: split failed midway', { i, error: (err as Error).message })
+            break
+          }
+          await new Promise<void>(r => setTimeout(r, 1500))
+        }
+
+        const startedAt = Date.now()
+        while (Date.now() - startedAt < SPLIT_POLL_TIMEOUT_MS) {
+          await new Promise<void>(r => setTimeout(r, SPLIT_POLL_INTERVAL_MS))
+          accounts = await ctx.twilight.walletAccounts()
+          const usableNow = accounts.filter(fresh).length
+          if (usableNow >= minFresh) {
+            log.info('volume-farm: prefund complete', { usableNow })
+            break
+          }
+        }
+      } catch (err) {
+        log.error('volume-farm prefund failed', { error: (err as Error).message })
+      }
     } else if (id === 'market-maker') {
       const layers = Math.max(1, (cfg.layers as number) ?? 2)
       const quoteSize = (cfg.quoteSizeSats as number) ?? 10_000

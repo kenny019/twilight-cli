@@ -149,14 +149,68 @@ describe('VolumeFarmStrategy', () => {
     expect(ctx.hyperliquid!.openPosition).not.toHaveBeenCalled()
   })
 
-  it('skips if no eligible Coin account exists', async () => {
+  it('skips if no eligible Coin account exists and replenish fails', async () => {
     ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
       { index: 7, balance: 13000, onChain: false, ioType: 'Coin' },    // off-chain
       { index: 8, balance: 13000, onChain: true,  ioType: 'Memo' },    // wrong type
       { index: 9, balance: 1000,  onChain: true,  ioType: 'Coin' },    // too small
     ])
+    ;(ctx.twilight.walletBalance as any).mockResolvedValue({ nyks: 1000, sats: 0 })
     await strategy.tick()
     expect(ctx.twilight.openTrade).not.toHaveBeenCalled()
+  })
+
+  it('auto-replenishes when pool is dry, then completes the round', async () => {
+    let call = 0
+    const dry = [{ index: 9, balance: 1000, onChain: true, ioType: 'Coin', txType: '-' }]
+    const filled = [{ index: 30, balance: 13000, onChain: true, ioType: 'Coin', txType: '-' }]
+    ;(ctx.twilight.walletAccounts as any).mockImplementation(() => {
+      call++
+      return Promise.resolve(call <= 1 ? dry : filled)
+    })
+    ;(ctx.twilight.walletBalance as any).mockResolvedValue({ nyks: 1000, sats: 200_000 })
+    ;(ctx.twilight.fund as any).mockResolvedValue({ requestId: 'F1', accountIndex: 20, status: 'success' })
+    ;(ctx.twilight.split as any).mockResolvedValue({ requestId: 'S1', accountIndex: 0, status: 'success' })
+
+    ;(strategy as any).replenishPollIntervalMs = 1
+    ;(strategy as any).replenishPollTimeoutMs = 50
+    ;(strategy as any).replenishInterSplitMs = 0
+
+    await strategy.tick()
+
+    expect(ctx.twilight.fund).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.split).toHaveBeenCalled()
+    expect(ctx.twilight.openTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.openTrade).toHaveBeenCalledWith(30, expect.any(String), expect.any(Number), 1)
+  })
+
+  it('trips killswitch after maxConsecutiveFailures when wallet has no sats', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([])
+    ;(ctx.twilight.walletBalance as any).mockResolvedValue({ nyks: 1000, sats: 0 })
+    ;(strategy as any).replenishCooldownMs = 0
+
+    await strategy.tick()
+    await strategy.tick()
+    await strategy.tick()
+    expect(strategy.status().status).toBe('stopped')
+  })
+
+  it('cooldown prevents re-replenish on subsequent ticks (no killswitch trip)', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([])
+    ;(ctx.twilight.walletBalance as any).mockResolvedValue({ nyks: 1000, sats: 200_000 })
+    ;(ctx.twilight.fund as any).mockResolvedValue({ requestId: 'F1', accountIndex: 20, status: 'success' })
+    ;(ctx.twilight.split as any).mockResolvedValue({ requestId: 'S1', accountIndex: 0, status: 'success' })
+    ;(strategy as any).replenishPollIntervalMs = 1
+    ;(strategy as any).replenishPollTimeoutMs = 5
+    ;(strategy as any).replenishCooldownMs = 1_000_000
+    ;(strategy as any).replenishInterSplitMs = 0
+
+    await strategy.tick()
+    await strategy.tick()
+    await strategy.tick()
+
+    expect(ctx.twilight.fund).toHaveBeenCalledTimes(1)
+    expect(strategy.status().status).toBe('active')
   })
 
   it('skips if HL balance below requiredMargin + buffer', async () => {

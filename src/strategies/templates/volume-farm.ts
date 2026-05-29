@@ -58,6 +58,14 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   private lastSide: OrderSide = 'SHORT'              // alternate flips it to LONG first
   private dailyVolume: DailyVolume = { date: '', sats: 0 }
   private totalVolume = 0                            // lifetime since process start
+  private replenishInFlight = false
+  private lastReplenishAt = 0
+  // Tunable for tests
+  replenishCooldownMs = 5 * 60_000
+  replenishPollIntervalMs = 3_000
+  replenishPollTimeoutMs = 30_000
+  replenishChildCount = 10
+  replenishInterSplitMs = 1_500
 
   async init(config: StrategyConfig, ctx: Context): Promise<void> {
     this.ctx = ctx
@@ -159,7 +167,8 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     if (hedged && !ctx.hyperliquid) return
 
     // Pick an idle Twilight account. If none is fresh (Coin/-), try
-    // recovering a stale Coin/ORDERTX (interrupted-round residue) once.
+    // recovering a stale Coin/ORDERTX (interrupted-round residue), then
+    // fall back to auto-replenishing from the main wallet.
     let accounts = await ctx.twilight.walletAccounts()
     let account = this.pickAccount(accounts)
     if (!account) {
@@ -170,11 +179,21 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       }
     }
     if (!account) {
-      ctx.log.warn('volume-farm: no eligible fresh Coin account', {
-        dedicated: cfg.dedicatedAccountIndices,
-        requiredSize: cfg.positionSizeSats,
-      })
-      return
+      const replenishResult = await this.tryReplenish(ctx)
+      if (replenishResult === 'replenished') {
+        accounts = await ctx.twilight.walletAccounts()
+        account = this.pickAccount(accounts)
+        if (!account) {
+          this.recordFailure(ctx, 'no-eligible-account', new Error('replenish reported success but no account picked'))
+          return
+        }
+      } else if (replenishResult === 'cooldown') {
+        ctx.log.debug('volume-farm: pool dry, replenish on cooldown')
+        return
+      } else {
+        this.recordFailure(ctx, 'no-eligible-account', new Error(`pool dry; replenish=${replenishResult}`))
+        return
+      }
     }
 
     const twilightMark = await ctx.twilight.marketPrice()
@@ -334,6 +353,63 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     } catch (err) {
       ctx.log.warn('volume-farm: stale account rotation failed', { accountIndex: stale.index, error: (err as Error).message })
       return false
+    }
+  }
+
+  // Auto-fund fresh Coin/- accounts from the main wallet when the pool runs
+  // dry. relayer-cli v0.1.2 rejects multi-balance splits with "No new
+  // accounts to create", so we split 1-by-1.
+  private async tryReplenish(ctx: Context): Promise<'replenished' | 'cooldown' | 'no-funds' | 'failed'> {
+    if (this.replenishInFlight) return 'cooldown'
+    if (Date.now() - this.lastReplenishAt < this.replenishCooldownMs) return 'cooldown'
+
+    this.replenishInFlight = true
+    this.lastReplenishAt = Date.now()
+    const cfg = this.config
+    const childSize = Math.max(cfg.positionSizeSats * 2, 5_000)
+    const childCount = this.replenishChildCount
+    const fundAmount = childSize * childCount
+
+    try {
+      const { sats } = await ctx.twilight.walletBalance()
+      if (sats < fundAmount) {
+        ctx.log.error('volume-farm: replenish — wallet sats below fund amount', { walletSats: sats, required: fundAmount })
+        return 'no-funds'
+      }
+
+      const fundResult = await ctx.twilight.fund(fundAmount)
+      ctx.log.info('volume-farm: replenish funded parent', { parentIndex: fundResult.accountIndex, fundAmount, childCount, childSize })
+
+      for (let i = 0; i < childCount; i++) {
+        try {
+          await ctx.twilight.split(fundResult.accountIndex, [childSize])
+        } catch (err) {
+          ctx.log.warn('volume-farm: replenish split failed midway', { i, error: (err as Error).message })
+          break
+        }
+        if (this.replenishInterSplitMs > 0) await new Promise(r => setTimeout(r, this.replenishInterSplitMs))
+      }
+
+      const deadline = Date.now() + this.replenishPollTimeoutMs
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, this.replenishPollIntervalMs))
+        const fresh = (await ctx.twilight.walletAccounts())
+          .filter(a => a.onChain
+            && a.ioType === 'Coin'
+            && (a.txType === '-' || a.txType === undefined)
+            && a.balance >= cfg.positionSizeSats)
+        if (fresh.length >= 1) {
+          ctx.log.info('volume-farm: replenish complete', { freshCount: fresh.length, childSize })
+          return 'replenished'
+        }
+      }
+      ctx.log.warn('volume-farm: replenish timed out waiting for children')
+      return 'failed'
+    } catch (err) {
+      ctx.log.error('volume-farm: replenish exception', { error: (err as Error).message })
+      return 'failed'
+    } finally {
+      this.replenishInFlight = false
     }
   }
 
