@@ -296,6 +296,62 @@ describe('VolumeFarmStrategy', () => {
     expect(restored.totalVolume).toBe(10_000)
   })
 
+  it('marks an account chain-dead on UTXO-not-found and skips it thereafter', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+      { index: 50, balance: 8000, onChain: true, ioType: 'Coin', txType: 'ORDERTX' },
+    ])
+    ;(ctx.twilight.transfer as any).mockRejectedValue(
+      new Error('relayer-cli failed: ... { Error: UTXO not found } ... expected struct UtxoDetailResponse'),
+    )
+    const r1 = await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)
+    expect(r1).toMatchObject({ reclaimed: 0 })
+
+    // Second pass: account 50 is now in the skip-set, so it's not retried.
+    const r2 = await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)   // unchanged
+    expect(r2).toMatchObject({ reclaimed: 0, remaining: 0 })
+  })
+
+  it('transient reclaim failure does NOT mark dead (stays retryable)', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+      { index: 51, balance: 8000, onChain: true, ioType: 'Coin', txType: 'ORDERTX' },
+    ])
+    ;(ctx.twilight.transfer as any).mockRejectedValue(new Error('network timeout'))
+    await strategy.reconcileStuck(ctx)
+    await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(2)   // retried, not skipped
+  })
+
+  it('dead-account skip-set persists and is honored after a fresh init', async () => {
+    const store = new Map<string, string>()
+    ;(ctx as any).db = {
+      getKV: (k: string) => store.get(k),
+      setKV: (k: string, v: string) => { store.set(k, v) },
+    }
+    const cfg = {
+      positionSizeSats: 5_000, checkIntervalMs: 30_000, dedicatedAccountIndices: [],
+      hyperliquidLeverage: 1, hyperliquidMarginBufferUsdc: 5,
+      dailyVolumeCapSats: 50_000_000, maxConsecutiveFailures: 3, sideRotation: 'alternate' as const,
+    }
+    const s1 = new VolumeFarmStrategy()
+    await s1.init(cfg, ctx)
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+      { index: 52, balance: 8000, onChain: true, ioType: 'Coin', txType: 'ORDERTX' },
+    ])
+    ;(ctx.twilight.transfer as any).mockRejectedValue(new Error('{ Error: UTXO not found }'))
+    await s1.reconcileStuck(ctx)
+    expect(store.has('volume-farm:dead-accounts')).toBe(true)
+
+    // restart: fresh instance loads the skip-set, never attempts account 52
+    const s2 = new VolumeFarmStrategy()
+    await s2.init(cfg, ctx)
+    ;(ctx.twilight.transfer as any).mockClear()
+    const res = await s2.reconcileStuck(ctx)
+    expect(ctx.twilight.transfer).not.toHaveBeenCalled()
+    expect(res).toMatchObject({ reclaimed: 0, remaining: 0 })
+  })
+
   it('reconcileStuck closes an orphaned OPEN position and alerts', async () => {
     ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
       { index: 5, balance: 5000, onChain: true, ioType: 'Memo', txType: 'ORDERTX' },

@@ -11,6 +11,7 @@ import type { ProposableStrategy, TradeProposal, AgentEvaluation } from '../../t
 import { DEFAULT_EVALUATION } from '../../types/agent.js'
 
 const VOLUME_KV_KEY = 'volume-farm:volume'
+const DEAD_KV_KEY = 'volume-farm:dead-accounts'
 
 interface VolumeFarmConfig {
   positionSizeSats: number               // size per round-trip on Twilight
@@ -66,6 +67,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   private totalMarkPnlSats = 0                       // cumulative mark-to-mark drift over holds (±)
   private replenishInFlight = false
   private lastReplenishAt = 0
+  private deadAccounts = new Set<number>()           // chain-dead (UTXO not found) — never retry
   // Tunable for tests
   replenishCooldownMs = 5 * 60_000
   replenishPollIntervalMs = 3_000
@@ -90,6 +92,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       ...config as Partial<VolumeFarmConfig>,
     }
     this.loadVolumeState(ctx)
+    this.loadDeadAccounts(ctx)
   }
 
   // Volume/cost counters persist across restarts so the daily cap can't be
@@ -125,6 +128,37 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       }))
     } catch (err) {
       ctx.log.warn('volume-farm: failed to persist volume state', { error: (err as Error).message })
+    }
+  }
+
+  private loadDeadAccounts(ctx: Context): void {
+    const db = ctx.db as { getKV?: (k: string) => string | undefined } | undefined
+    if (typeof db?.getKV !== 'function') return
+    try {
+      const raw = db.getKV(DEAD_KV_KEY)
+      if (!raw) return
+      const arr = JSON.parse(raw) as number[]
+      this.deadAccounts = new Set(arr)
+      if (arr.length) ctx.log.info('volume-farm: loaded chain-dead account skip-set', { count: arr.length, indices: arr })
+    } catch (err) {
+      ctx.log.warn('volume-farm: failed to load dead-account skip-set', { error: (err as Error).message })
+    }
+  }
+
+  // Permanently skip an account whose UTXO no longer exists on-chain. Such an
+  // account can never be transferred/unlocked, so retrying it just wastes ~30s
+  // of relayer-cli retries on every boot and dry-pool tick. Persisted so the
+  // skip survives restarts.
+  private markDead(ctx: Context, index: number): void {
+    if (this.deadAccounts.has(index)) return
+    this.deadAccounts.add(index)
+    ctx.log.warn('volume-farm: account is chain-dead (UTXO not found) — adding to skip-set', { accountIndex: index, deadCount: this.deadAccounts.size })
+    const db = ctx.db as { setKV?: (k: string, v: string) => void } | undefined
+    if (typeof db?.setKV !== 'function') return
+    try {
+      db.setKV(DEAD_KV_KEY, JSON.stringify([...this.deadAccounts]))
+    } catch (err) {
+      ctx.log.warn('volume-farm: failed to persist dead-account skip-set', { error: (err as Error).message })
     }
   }
 
@@ -414,6 +448,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   //     OPEN position from a crash, or a settled-but-unrotated close).
   // Empty Coin/ORDERTX husks (balance 0, post-rotation residue) are ignored.
   private isStuck(a: TwilightAccount): boolean {
+    if (this.deadAccounts.has(a.index)) return false
     if (!a.onChain || !this.indexAllowed(a.index)) return false
     if (a.ioType === 'Coin' && a.txType === 'ORDERTX' && a.balance >= this.config.positionSizeSats) return true
     if (a.ioType === 'Memo' && a.balance > 0) return true
@@ -452,7 +487,13 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       ctx.log.debug('volume-farm: stuck account in transient state — skipping', { accountIndex: account.index, orderStatus })
       return null
     } catch (err) {
-      ctx.log.warn('volume-farm: reclaim failed — will retry later', { accountIndex: account.index, error: (err as Error).message })
+      const msg = (err as Error).message
+      if (/utxo not found/i.test(msg)) {
+        // Chain-dead: the UTXO is gone, so this can never succeed. Skip forever.
+        this.markDead(ctx, account.index)
+      } else {
+        ctx.log.warn('volume-farm: reclaim failed — will retry later', { accountIndex: account.index, error: msg })
+      }
       return null
     }
   }
