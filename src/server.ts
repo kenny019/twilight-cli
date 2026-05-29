@@ -375,6 +375,18 @@ async function startServer() {
       const record = db.getStrategy(id)
 
       await strategy.init(strategyConfig, ctx)
+
+      // Reclaim accounts left mid-lifecycle by a previous crash/restart
+      // (orphaned open positions, settled-but-unrotated residue) before ticking.
+      const reconcilable = strategy as unknown as { reconcileStuck?: (c: typeof ctx) => Promise<unknown> }
+      if (typeof reconcilable.reconcileStuck === 'function') {
+        try {
+          await reconcilable.reconcileStuck(ctx)
+        } catch (err) {
+          log.warn('boot reconcile failed — continuing', { id, error: (err as Error).message })
+        }
+      }
+
       await scheduler.register(strategy, { interval: tickIntervalForStrategy(id, strategyConfig) }, ctx)
       liveStrategies.set(id, strategy)
 

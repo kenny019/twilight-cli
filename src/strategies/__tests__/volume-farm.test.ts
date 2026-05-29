@@ -95,8 +95,9 @@ describe('VolumeFarmStrategy', () => {
     expect(ctx.twilight.closeTrade).toHaveBeenCalledTimes(1)
     expect(ctx.twilight.unlockTrade).toHaveBeenCalledTimes(1)
     expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)
-    // but counts as a failure
-    expect(strategy.status().errorCount + (strategy as any).consecutiveFailures).toBeGreaterThan(0)
+    // recordFailure bumps both counters by exactly one
+    expect((strategy as any).consecutiveFailures).toBe(1)
+    expect(strategy.status().errorCount).toBe(1)
   })
 
   it('daily volume cap halts further opens', async () => {
@@ -241,11 +242,124 @@ describe('VolumeFarmStrategy', () => {
     await strategy.tick()
     await strategy.tick()
     expect(strategy.status().status).toBe('stopped')
+    // killswitch trip must fire an alert — the only operator-visible signal
+    expect(ctx.alert.send).toHaveBeenCalledTimes(1)
+    expect((ctx.alert.send as any).mock.calls[0][0]).toMatchObject({ type: 'error' })
     // Subsequent ticks short-circuit
     ;(ctx.hyperliquid!.openPosition as any).mockResolvedValue({ status: 'filled', size: 0.0001, raw: {} })
     await strategy.tick()
     // openTrade should still not be called (strategy is disabled)
     expect(ctx.twilight.openTrade).not.toHaveBeenCalled()
+  })
+
+  it('tracks per-round cost: fee estimate + mark-to-mark drift in status', async () => {
+    // marketPrice mock returns a constant, so mark drift is 0 and only the
+    // fee estimate accrues: 2 legs × 5000 sats × 0.0004 = 4 sats.
+    await strategy.tick()
+    const cfg = strategy.status().config as any
+    expect(cfg.totalFeesSats).toBe(4)
+    expect(cfg.totalMarkPnlSats).toBe(0)
+    expect(cfg.netCostSats).toBe(4)
+  })
+
+  it('mark-to-mark drift is signed by side (LONG gains when mark rises)', async () => {
+    // entry mark 76700 (open) then exit mark 77467 (~+1%) → LONG nets +~50 sats
+    ;(ctx.twilight.marketPrice as any)
+      .mockResolvedValueOnce(76700)   // open (LONG in alternate mode)
+      .mockResolvedValueOnce(77467)   // close
+    await strategy.tick()
+    const cfg = strategy.status().config as any
+    expect(cfg.totalMarkPnlSats).toBeGreaterThan(0)
+  })
+
+  it('persists volume state and restores it on a fresh init (cap survives restart)', async () => {
+    const store = new Map<string, string>()
+    ;(ctx as any).db = {
+      getKV: (k: string) => store.get(k),
+      setKV: (k: string, v: string) => { store.set(k, v) },
+    }
+    const cfg = {
+      positionSizeSats: 5_000, checkIntervalMs: 30_000, dedicatedAccountIndices: [],
+      hyperliquidLeverage: 1, hyperliquidMarginBufferUsdc: 5,
+      dailyVolumeCapSats: 50_000_000, maxConsecutiveFailures: 3, sideRotation: 'alternate' as const,
+    }
+    const s1 = new VolumeFarmStrategy()
+    await s1.init(cfg, ctx)
+    await s1.tick()   // one round → 10_000 sats, persisted to kv
+    expect(store.has('volume-farm:volume')).toBe(true)
+
+    // simulate restart: new instance, same kv-backed ctx
+    const s2 = new VolumeFarmStrategy()
+    await s2.init(cfg, ctx)
+    const restored = s2.status().config as any
+    expect(restored.dailyVolumeSats).toBe(10_000)
+    expect(restored.totalVolume).toBe(10_000)
+  })
+
+  it('reconcileStuck closes an orphaned OPEN position and alerts', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+      { index: 5, balance: 5000, onChain: true, ioType: 'Memo', txType: 'ORDERTX' },
+    ])
+    ;(ctx.twilight.queryTrade as any).mockResolvedValue({ orderStatus: 'FILLED', raw: {} })
+    const res = await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.closeTrade).toHaveBeenCalledWith(5, { skipRotation: true })
+    expect(ctx.twilight.unlockTrade).toHaveBeenCalledWith(5)
+    expect(ctx.twilight.transfer).toHaveBeenCalledWith(5)
+    expect(res).toMatchObject({ reclaimed: 1, orphans: 1 })
+    expect(ctx.alert.send).toHaveBeenCalledTimes(1)
+    expect((ctx.alert.send as any).mock.calls[0][0]).toMatchObject({ type: 'risk' })
+  })
+
+  it('reconcileStuck unlocks + rotates a SETTLED Memo account without closing or alerting', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+      { index: 6, balance: 4996, onChain: true, ioType: 'Memo', txType: 'ORDERTX' },
+    ])
+    ;(ctx.twilight.queryTrade as any).mockResolvedValue({ orderStatus: 'SETTLED', raw: {} })
+    const res = await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.closeTrade).not.toHaveBeenCalled()
+    expect(ctx.twilight.unlockTrade).toHaveBeenCalledWith(6)
+    expect(ctx.twilight.transfer).toHaveBeenCalledWith(6)
+    expect(res).toMatchObject({ reclaimed: 1, orphans: 0 })
+    expect(ctx.alert.send).not.toHaveBeenCalled()
+  })
+
+  it('reconcileStuck ignores empty Coin/ORDERTX husks, rotates only funded ones', async () => {
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue([
+      { index: 10, balance: 0,    onChain: true, ioType: 'Coin', txType: 'ORDERTX' },  // empty husk
+      { index: 11, balance: 8000, onChain: true, ioType: 'Coin', txType: 'ORDERTX' },  // funded
+      { index: 12, balance: 9000, onChain: true, ioType: 'Coin', txType: '-' },        // fresh, not stuck
+    ])
+    const res = await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.transfer).toHaveBeenCalledWith(11)
+    expect(res).toMatchObject({ reclaimed: 1, orphans: 0 })
+  })
+
+  it('boot reconcile is bounded by maxReclaimPerBoot', async () => {
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      index: 100 + i, balance: 8000, onChain: true, ioType: 'Coin', txType: 'ORDERTX',
+    }))
+    ;(ctx.twilight.walletAccounts as any).mockResolvedValue(many)
+    ;(strategy as any).maxReclaimPerBoot = 25
+    const res = await strategy.reconcileStuck(ctx)
+    expect(ctx.twilight.transfer).toHaveBeenCalledTimes(25)
+    expect(res).toMatchObject({ reclaimed: 25, remaining: 5 })
+  })
+
+  it('tick reclaims a stuck account when pool is dry, then completes the round', async () => {
+    let call = 0
+    const stuckOnly = [{ index: 6, balance: 4996, onChain: true, ioType: 'Memo', txType: 'ORDERTX' }]
+    const fresh = [{ index: 40, balance: 13000, onChain: true, ioType: 'Coin', txType: '-' }]
+    ;(ctx.twilight.walletAccounts as any).mockImplementation(() => {
+      call++
+      return Promise.resolve(call <= 1 ? stuckOnly : fresh)
+    })
+    ;(ctx.twilight.queryTrade as any).mockResolvedValue({ orderStatus: 'SETTLED', raw: {} })
+    await strategy.tick()
+    expect(ctx.twilight.unlockTrade).toHaveBeenCalledWith(6)         // reclaimed the stuck one
+    expect(ctx.twilight.openTrade).toHaveBeenCalledTimes(1)
+    expect(ctx.twilight.openTrade).toHaveBeenCalledWith(40, expect.any(String), expect.any(Number), 1)
+    expect(ctx.twilight.fund).not.toHaveBeenCalled()                 // reclaim preempted replenish
   })
 
   it('inert when hyperliquid client not configured', async () => {

@@ -5,9 +5,12 @@ import type {
   Context,
   OrderSide,
   TwilightAccount,
+  TwilightOrderStatus,
 } from '../../types/index.js'
 import type { ProposableStrategy, TradeProposal, AgentEvaluation } from '../../types/agent.js'
 import { DEFAULT_EVALUATION } from '../../types/agent.js'
+
+const VOLUME_KV_KEY = 'volume-farm:volume'
 
 interface VolumeFarmConfig {
   positionSizeSats: number               // size per round-trip on Twilight
@@ -19,6 +22,7 @@ interface VolumeFarmConfig {
   dailyVolumeCapSats: number             // cumulative Twilight notional/day (both sides counted)
   maxConsecutiveFailures: number         // trip per-strategy killswitch after N
   sideRotation: 'alternate' | 'random' | 'long-only' | 'short-only'
+  feeRatePerLeg: number                  // protocol fee fraction per leg (e.g. 0.0004 = 0.04%)
 }
 
 interface DailyVolume {
@@ -58,6 +62,8 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   private lastSide: OrderSide = 'SHORT'              // alternate flips it to LONG first
   private dailyVolume: DailyVolume = { date: '', sats: 0 }
   private totalVolume = 0                            // lifetime since process start
+  private totalFeesSats = 0                          // cumulative estimated fees paid
+  private totalMarkPnlSats = 0                       // cumulative mark-to-mark drift over holds (±)
   private replenishInFlight = false
   private lastReplenishAt = 0
   // Tunable for tests
@@ -66,6 +72,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
   replenishPollTimeoutMs = 30_000
   replenishChildCount = 10
   replenishInterSplitMs = 1_500
+  maxReclaimPerBoot = 25     // bound boot reconcile so a large backlog can't stall startup
 
   async init(config: StrategyConfig, ctx: Context): Promise<void> {
     this.ctx = ctx
@@ -79,7 +86,45 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       dailyVolumeCapSats:          50_000_000,        // ~$385 notional/day default
       maxConsecutiveFailures:      3,
       sideRotation:                'alternate',
+      feeRatePerLeg:               0.0004,            // 0.04% market fill/settle (per market fee-rate)
       ...config as Partial<VolumeFarmConfig>,
+    }
+    this.loadVolumeState(ctx)
+  }
+
+  // Volume/cost counters persist across restarts so the daily cap can't be
+  // bypassed by a mid-day restart (propose() resets the daily figure on UTC
+  // rollover regardless of what was loaded).
+  private loadVolumeState(ctx: Context): void {
+    const db = ctx.db as { getKV?: (k: string) => string | undefined } | undefined
+    if (typeof db?.getKV !== 'function') return
+    try {
+      const raw = db.getKV(VOLUME_KV_KEY)
+      if (!raw) return
+      const s = JSON.parse(raw) as Partial<{ date: string; dailySats: number; totalSats: number; totalFeesSats: number; totalMarkPnlSats: number }>
+      this.dailyVolume = { date: s.date ?? '', sats: s.dailySats ?? 0 }
+      this.totalVolume = s.totalSats ?? 0
+      this.totalFeesSats = s.totalFeesSats ?? 0
+      this.totalMarkPnlSats = s.totalMarkPnlSats ?? 0
+      ctx.log.info('volume-farm: restored volume state', { date: this.dailyVolume.date, dailySats: this.dailyVolume.sats, totalSats: this.totalVolume })
+    } catch (err) {
+      ctx.log.warn('volume-farm: failed to restore volume state', { error: (err as Error).message })
+    }
+  }
+
+  private persistVolumeState(ctx: Context): void {
+    const db = ctx.db as { setKV?: (k: string, v: string) => void } | undefined
+    if (typeof db?.setKV !== 'function') return
+    try {
+      db.setKV(VOLUME_KV_KEY, JSON.stringify({
+        date: this.dailyVolume.date,
+        dailySats: this.dailyVolume.sats,
+        totalSats: this.totalVolume,
+        totalFeesSats: this.totalFeesSats,
+        totalMarkPnlSats: this.totalMarkPnlSats,
+      }))
+    } catch (err) {
+      ctx.log.warn('volume-farm: failed to persist volume state', { error: (err as Error).message })
     }
   }
 
@@ -90,7 +135,15 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     return {
       id: this.id, status: this.running && !this.disabled ? 'active' : 'stopped',
       tickCount: this.tickCount, errorCount: this.errorCount, lastTick: this.lastTick,
-      config: { ...this.config, totalVolume: this.totalVolume, dailyVolumeSats: this.dailyVolume.sats, dailyVolumeDate: this.dailyVolume.date },
+      config: {
+        ...this.config,
+        totalVolume: this.totalVolume,
+        dailyVolumeSats: this.dailyVolume.sats,
+        dailyVolumeDate: this.dailyVolume.date,
+        totalFeesSats: this.totalFeesSats,
+        totalMarkPnlSats: this.totalMarkPnlSats,
+        netCostSats: this.totalFeesSats - this.totalMarkPnlSats,
+      },
     }
   }
 
@@ -166,13 +219,13 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     const hedged = cfg.hedge === 'hyperliquid'
     if (hedged && !ctx.hyperliquid) return
 
-    // Pick an idle Twilight account. If none is fresh (Coin/-), try
-    // recovering a stale Coin/ORDERTX (interrupted-round residue), then
-    // fall back to auto-replenishing from the main wallet.
+    // Pick an idle Twilight account. If none is fresh (Coin/-), try reclaiming
+    // one stuck account (Coin/ORDERTX residue, or a Memo account left by an
+    // interrupted round), then fall back to auto-replenishing from the wallet.
     let accounts = await ctx.twilight.walletAccounts()
     let account = this.pickAccount(accounts)
     if (!account) {
-      const recovered = await this.tryRecoverStaleAccount(ctx, accounts)
+      const recovered = await this.tryReclaimStuckAccount(ctx, accounts)
       if (recovered) {
         accounts = await ctx.twilight.walletAccounts()
         account = this.pickAccount(accounts)
@@ -188,7 +241,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
           return
         }
       } else if (replenishResult === 'cooldown') {
-        ctx.log.debug('volume-farm: pool dry, replenish on cooldown')
+        ctx.log.warn('volume-farm: pool dry, replenish on cooldown — strategy idle until it expires')
         return
       } else {
         this.recordFailure(ctx, 'no-eligible-account', new Error(`pool dry; replenish=${replenishResult}`))
@@ -196,7 +249,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
       }
     }
 
-    const twilightMark = await ctx.twilight.marketPrice()
+    const entryMark = await ctx.twilight.marketPrice()
     const twilightSide = this.pickSide()
 
     // ── Optional HL hedge open ─────────────────────────────────────
@@ -227,7 +280,7 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     }
 
     // ── Twilight open ──────────────────────────────────────────────
-    const twOpen = await ctx.twilight.openTrade(account.index, twilightSide, twilightMark, 1).catch((e: Error) => ({ error: e }))
+    const twOpen = await ctx.twilight.openTrade(account.index, twilightSide, entryMark, 1).catch((e: Error) => ({ error: e }))
     if ('error' in twOpen) {
       ctx.log.error('volume-farm: Twilight open failed', { err: twOpen.error.message, hedged })
       if (hedged) await this.safeCompensatingClose(ctx, hlSide, hlOpenSize)
@@ -259,6 +312,10 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
         // Continue; HL position will need manual cleanup
       }
     }
+
+    // Sample mark just before close to measure mark-to-mark drift over the
+    // hold (the only price cost in hedge:none mode, since fills are at mark).
+    const exitMark = await ctx.twilight.marketPrice().catch(() => entryMark)
 
     // skipRotation: we'll do unlock + transfer ourselves AFTER SETTLED.
     const twClose = await ctx.twilight.closeTrade(account.index, { skipRotation: true }).catch((e: Error) => ({ error: e }))
@@ -302,12 +359,28 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     this.totalVolume += roundVolume
     this.consecutiveFailures = 0
 
+    // Cost estimate. Fee: positionSize × feeRatePerLeg × 2 legs. Mark drift:
+    // signed mark-to-mark over the hold (LONG profits when mark rose). Both in
+    // sats so net cost = fees − markPnl is directly comparable to volume.
+    const feeEstSats = Math.round(2 * cfg.positionSizeSats * cfg.feeRatePerLeg)
+    const markRet = entryMark > 0 ? (exitMark - entryMark) / entryMark : 0
+    const dir = twilightSide === 'LONG' ? 1 : -1
+    const markPnlSats = Math.round(dir * markRet * cfg.positionSizeSats)
+    this.totalFeesSats += feeEstSats
+    this.totalMarkPnlSats += markPnlSats
+    this.persistVolumeState(ctx)
+
     ctx.log.info('volume-farm round complete', {
       side: twilightSide,
       accountIndex: account.index,
       roundVolumeSats: roundVolume,
       dailyVolumeSats: this.dailyVolume.sats,
       totalVolumeSats: this.totalVolume,
+      entryMark,
+      exitMark,
+      feeEstSats,
+      markPnlSats,
+      netCostSats: this.totalFeesSats - this.totalMarkPnlSats,
     })
   }
 
@@ -330,30 +403,107 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
     )
   }
 
-  // Recover a Coin/ORDERTX account by rotating it to fresh Coin/-. Used at
-  // tick start when a prior round was interrupted before the post-close
-  // transfer completed.
-  private async tryRecoverStaleAccount(ctx: Context, accounts: TwilightAccount[]): Promise<boolean> {
-    const cfg = this.config
-    const indexFilter = cfg.dedicatedAccountIndices.length === 0
-      ? () => true
-      : (idx: number) => cfg.dedicatedAccountIndices.includes(idx)
-    const stale = accounts.find(a =>
-      indexFilter(a.index)
-      && a.onChain
-      && a.ioType === 'Coin'
-      && a.txType === 'ORDERTX'
-      && a.balance >= cfg.positionSizeSats,
-    )
-    if (!stale) return false
+  private indexAllowed(idx: number): boolean {
+    const ded = this.config.dedicatedAccountIndices
+    return ded.length === 0 || ded.includes(idx)
+  }
+
+  // A funded account stuck mid-lifecycle that should be reclaimed to fresh:
+  //   • Coin/ORDERTX with balance — unlocked but never rotated.
+  //   • Memo with balance — an order is still attached (either an orphaned
+  //     OPEN position from a crash, or a settled-but-unrotated close).
+  // Empty Coin/ORDERTX husks (balance 0, post-rotation residue) are ignored.
+  private isStuck(a: TwilightAccount): boolean {
+    if (!a.onChain || !this.indexAllowed(a.index)) return false
+    if (a.ioType === 'Coin' && a.txType === 'ORDERTX' && a.balance >= this.config.positionSizeSats) return true
+    if (a.ioType === 'Memo' && a.balance > 0) return true
+    return false
+  }
+
+  // Drive one stuck account back to fresh Coin/-. Returns the order status it
+  // acted on ('FILLED' = an orphaned open position was closed), 'ROTATE' for a
+  // plain Coin/ORDERTX rotation, or null if it could not act. Best-effort:
+  // a failure leaves the account for a later attempt.
+  private async reclaimAccount(ctx: Context, account: TwilightAccount): Promise<TwilightOrderStatus | 'ROTATE' | null> {
     try {
-      await ctx.twilight.transfer(stale.index)
-      ctx.log.info('volume-farm: recovered stale Coin/ORDERTX account by rotating', { accountIndex: stale.index })
-      return true
+      if (account.ioType === 'Coin' && account.txType === 'ORDERTX') {
+        await ctx.twilight.transfer(account.index)
+        ctx.log.info('volume-farm: reclaimed Coin/ORDERTX by rotating', { accountIndex: account.index })
+        return 'ROTATE'
+      }
+      // Memo: inspect the attached order to decide close vs unlock.
+      const { orderStatus } = await ctx.twilight.queryTrade(account.index)
+      if (orderStatus === 'FILLED') {
+        // Orphaned OPEN position (a crash left it mid-round). The farm is always
+        // flat between rounds, so close → settle → unlock → rotate.
+        await ctx.twilight.closeTrade(account.index, { skipRotation: true })
+        await ctx.twilight.waitForOrderStatus(account.index, 'SETTLED', { timeoutMs: 30_000 })
+        await ctx.twilight.unlockTrade(account.index)
+        await ctx.twilight.transfer(account.index)
+        ctx.log.warn('volume-farm: reclaimed ORPHANED open position', { accountIndex: account.index })
+        return 'FILLED'
+      }
+      if (orderStatus === 'SETTLED') {
+        await ctx.twilight.unlockTrade(account.index)
+        await ctx.twilight.transfer(account.index)
+        ctx.log.info('volume-farm: reclaimed settled-but-unrotated account', { accountIndex: account.index })
+        return 'SETTLED'
+      }
+      ctx.log.debug('volume-farm: stuck account in transient state — skipping', { accountIndex: account.index, orderStatus })
+      return null
     } catch (err) {
-      ctx.log.warn('volume-farm: stale account rotation failed', { accountIndex: stale.index, error: (err as Error).message })
-      return false
+      ctx.log.warn('volume-farm: reclaim failed — will retry later', { accountIndex: account.index, error: (err as Error).message })
+      return null
     }
+  }
+
+  // Tick-time: reclaim a single stuck account so capital recycles instead of
+  // leaking into stranded Memo/ORDERTX states. Returns true if it acted.
+  private async tryReclaimStuckAccount(ctx: Context, accounts: TwilightAccount[]): Promise<boolean> {
+    const stuck = accounts.find(a => this.isStuck(a))
+    if (!stuck) return false
+    return (await this.reclaimAccount(ctx, stuck)) !== null
+  }
+
+  // Boot-time: scan all accounts and reclaim stuck ones (bounded by
+  // maxReclaimPerBoot) before the scheduler starts ticking. Catches positions
+  // left OPEN by a crash (orphans → unhedged exposure) and settled-but-unrotated
+  // residue. Alerts if any orphaned open position was found. Assumes this is the
+  // only strategy holding positions (true in production: one strategy, flat
+  // between rounds), so any attached order is its own to reclaim.
+  async reconcileStuck(ctx: Context): Promise<{ reclaimed: number; orphans: number; remaining: number }> {
+    const accounts = await ctx.twilight.walletAccounts()
+    const stuck = accounts.filter(a => this.isStuck(a))
+    if (stuck.length === 0) return { reclaimed: 0, orphans: 0, remaining: 0 }
+
+    const batch = stuck.slice(0, this.maxReclaimPerBoot)
+    const remaining = stuck.length - batch.length
+    ctx.log.info('volume-farm: boot reconcile — stuck accounts found', {
+      total: stuck.length, processing: batch.length, remaining, indices: batch.map(a => a.index),
+    })
+
+    let reclaimed = 0
+    let orphans = 0
+    for (const a of batch) {
+      const result = await this.reclaimAccount(ctx, a)
+      if (result !== null) reclaimed++
+      if (result === 'FILLED') orphans++
+    }
+
+    if (orphans > 0) {
+      void ctx.alert.send({
+        type: 'risk',
+        title: 'volume-farm: orphaned open position(s) reclaimed on boot',
+        description: `${orphans} account(s) held an OPEN position after restart (unhedged exposure) and were closed. Reclaimed ${reclaimed}/${batch.length}; ${remaining} stuck account(s) remain.`,
+        fields: [
+          { name: 'orphans', value: String(orphans), inline: true },
+          { name: 'reclaimed', value: String(reclaimed), inline: true },
+          { name: 'remaining', value: String(remaining), inline: true },
+        ],
+      })
+    }
+    ctx.log.info('volume-farm: boot reconcile complete', { reclaimed, orphans, remaining })
+    return { reclaimed, orphans, remaining }
   }
 
   // Auto-fund fresh Coin/- accounts from the main wallet when the pool runs
@@ -424,11 +574,25 @@ export class VolumeFarmStrategy implements Strategy, ProposableStrategy {
 
   private recordFailure(ctx: Context, where: string, err: Error): void {
     this.consecutiveFailures++
+    this.errorCount++
     ctx.log.warn('volume-farm failure', { where, error: err.message, consecutiveFailures: this.consecutiveFailures })
     if (this.consecutiveFailures >= this.config.maxConsecutiveFailures) {
       this.disabled = true
       ctx.log.error('volume-farm: consecutive failure cap hit — strategy disabled', {
         consecutiveFailures: this.consecutiveFailures,
+      })
+      // Fire-and-forget: a tripped killswitch leaves the bot inert with the
+      // process alive (launchd won't restart it), so this alert is the only
+      // signal an operator gets. Mirrors funding-arb/market-maker.
+      void ctx.alert.send({
+        type: 'error',
+        title: 'volume-farm: per-strategy killswitch activated',
+        description: `${this.consecutiveFailures} consecutive failures (last: ${where} — ${err.message}). Strategy disabled until manual re-enable.`,
+        fields: [
+          { name: 'strategy', value: this.id, inline: true },
+          { name: 'lastFailure', value: where, inline: true },
+          { name: 'consecutiveFailures', value: String(this.consecutiveFailures), inline: true },
+        ],
       })
     }
   }
